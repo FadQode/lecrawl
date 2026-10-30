@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # $ Source locations are supplied by the environment, so the repository names no site.$
     listings_url: str = ""
     listings_language: str = ""
+    listings_secondary_url: str = ""
+    crawl_bilingual: bool = False
 
     reports_api_url: str = ""
     reports_api_key: str = ""

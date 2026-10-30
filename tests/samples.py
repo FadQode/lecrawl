@@ -24,6 +24,17 @@ ARTICLE_PARAGRAPHS: tuple[str, ...] = (
 ARTICLE_DATE = "Jan 08 2026"
 ARTICLE_IMAGE = "https://listing.example.test/storage/post/large/sample.png"
 
+EN_LISTING_URL = f"https://{LISTING_HOST}/en/news"
+EN_ARTICLE_PREFIX = f"{EN_LISTING_URL}/"
+EN_PAGE_TWO_URL = f"{EN_LISTING_URL}?page=2"
+EN_TITLE = "Sample English release title for the listings"
+EN_PARAGRAPHS: tuple[str, ...] = (
+    "The authority announced the details of the first release, noting that the new framework takes effect "
+    "together with the relevant partners in the sector.",
+    "It added that the next phase covers sharing expertise and reviewing the related texts so that "
+    "procedures stay clear and continuous.",
+)
+
 REPORTS_HOST = "reports.example.test"
 REPORTS_API_URL = "https://feed.example.test/content-api"
 REPORTS_ARTICLE_PATHS = ("/news/", "/reports/")
@@ -43,18 +54,27 @@ RELEASES_SECTIONS = (
 )
 
 
-def listing_html(*, cards: int = 20, next_page: str | None = PAGE_TWO_URL, duplicate_first: bool = False) -> bytes:
+def listing_html(
+    *,
+    cards: int = 20,
+    next_page: str | None = PAGE_TWO_URL,
+    duplicate_first: bool = False,
+    language: str = "ar",
+) -> bytes:
     """### Build a UAE listing document using the observed card markup."""
+    prefix = "/ar/news/" if language == "ar" else "/en/news/"
+    label = "خبر رقم" if language == "ar" else "Release number"
+    summary_label = "ملخص الخبر رقم" if language == "ar" else "Summary of release"
     items: list[str] = []
     for index in range(1, cards + 1):
-        summary = "" if index == 1 else f'<div class="desc_">ملخص الخبر رقم {index}</div>'
+        summary = "" if index == 1 else f'<div class="desc_">{summary_label} {index}</div>'
         items.append(
             '<div class="item_ animated_wrapper">'
-            f'<a class="link_" href="/ar/news/article-{index}">'
+            f'<a class="link_" href="{prefix}article-{index}">'
             f'<div class="image_box"><div class="img_"><img src="/storage/post/large/{index}.png"/></div></div>'
             '<div class="content_">'
             f'<div class="dateBox"><span>Jan {index:02d} 2026</span></div>'
-            f'<div class="title_">خبر رقم {index}</div>'
+            f'<div class="title_">{label} {index}</div>'
             f"{summary}"
             "</div></a></div>"
         )
@@ -189,6 +209,7 @@ def cba_article_html(
     summary_points: str | None = "A short summary of the release points.",
     sections: Sequence[tuple[str, str]] = RELEASES_SECTIONS,
     pdf_url: str | None = RELEASES_PDF_URL,
+    pdf_urls: Sequence[str] | None = None,
     excel_url: str | None = RELEASES_EXCEL_URL,
     with_body: bool = True,
     with_title: bool = True,
@@ -207,10 +228,12 @@ def cba_article_html(
         else ""
     )
     resources = ""
-    if pdf_url or excel_url:
-        links = ""
-        if pdf_url:
-            links += f'<p><a href="{pdf_url}" target="_blank">Sample Data (PDF)</a></p>'
+    attachments = list(pdf_urls) if pdf_urls is not None else ([pdf_url] if pdf_url else [])
+    if attachments or excel_url:
+        links = "".join(
+            f'<p><a href="{url}" target="_blank">Sample Data {index} (PDF)</a></p>'
+            for index, url in enumerate(attachments, start=1)
+        )
         if excel_url:
             links += f'<p><a href="{excel_url}" target="_blank">Sample Data (Excel)</a></p>'
         resources = (
@@ -230,3 +253,23 @@ def cba_article_html(
         "</div></main></body></html>"
     )
     return document.encode()
+
+
+def detail_html_en(
+    *,
+    title: str = EN_TITLE,
+    paragraphs: Sequence[str] = EN_PARAGRAPHS,
+    date_text: str | None = ARTICLE_DATE,
+    image_url: str | None = ARTICLE_IMAGE,
+    with_container: bool = True,
+    with_title_block: bool = True,
+) -> bytes:
+    """### Build an English UAE article document using the same template."""
+    return detail_html(
+        title=title,
+        paragraphs=paragraphs,
+        date_text=date_text,
+        image_url=image_url,
+        with_container=with_container,
+        with_title_block=with_title_block,
+    )

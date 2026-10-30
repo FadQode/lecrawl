@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--max-retries", type=int, default=None, help="retries for transient failures")
     crawl.add_argument("--concurrency", type=int, default=None, help="bounded concurrent detail fetches")
     crawl.add_argument("--no-robots", action="store_true", help="skip robots.txt checks")
+    crawl.add_argument("--bilingual", action="store_true", help="collect secondary-language localizations")
     crawl.add_argument(
         "--out",
         type=Path,
@@ -68,6 +69,8 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             language=settings.listings_language,
             max_listing_pages=page_bound(arguments, settings),
             concurrency=concurrency(arguments, settings),
+            bilingual=settings.crawl_bilingual or arguments.bilingual,
+            secondary_listing_url=settings.listings_secondary_url,
         )
     if name == "commerce":
         return CommerceReportsActor(

@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import hashlib
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TEXT_BEGIN_MARKER = "TEXT-BEGIN"
 
+# $ Extraction state shared by every linked resource, across sources.$
+ResourceStatus = Literal["pending", "complete", "not_applicable", "access_blocked", "failed", "url_unavailable"]
+
 
 class ArticleContentError(ValueError):
     """### Raised when a source page lacks the content the contract requires."""
+
+
+def compute_content_hash(text: str) -> str:
+    """### Return the canonical content hash for one extracted text document."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def ensure_text_marker(text: str) -> str:
@@ -40,10 +49,16 @@ class DocumentResource(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     title: str
-    url: str
+    url: str | None = None
     kind: str = "other"
     text: str | None = None
     error: str | None = None
+    # $ Optional enrichment keeps the canonical resource usable for every source.$
+    display_title: str | None = None
+    mime_type: str | None = None
+    file_size: int | None = None
+    content_hash: str | None = None
+    status: ResourceStatus | None = None
 
     @field_validator("text")
     @classmethod
@@ -83,6 +98,27 @@ class RawArticle(BaseModel):
         return "\n\n".join(paragraph for paragraph in self.paragraphs if paragraph.strip())
 
 
+class DocumentTranslation(BaseModel):
+    """### One additional language variant of a collected document."""
+
+    model_config = ConfigDict(frozen=True)
+
+    language: str
+    source_url: str
+    title: str
+    text: str
+    content_hash: str
+    published_at: date | None = None
+    summary: str | None = None
+    image_url: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def _mark_collected_text(cls, value: str) -> str:
+        """### Ensure translated text carries the required marker."""
+        return ensure_text_marker(value)
+
+
 class CanonicalDocument(BaseModel):
     """### Stored representation of one collected document."""
 
@@ -100,6 +136,7 @@ class CanonicalDocument(BaseModel):
     type_of_law: str | None = None
     topics: tuple[str, ...] = ()
     resources: tuple[DocumentResource, ...] = ()
+    translations: tuple[DocumentTranslation, ...] = ()
 
     @classmethod
     def from_raw(cls, raw: RawArticle) -> CanonicalDocument:
@@ -111,7 +148,7 @@ class CanonicalDocument(BaseModel):
             title=raw.title,
             language=raw.language,
             text=body,
-            content_hash=hashlib.sha256(body.encode("utf-8")).hexdigest() if body is not None else None,
+            content_hash=compute_content_hash(body) if body is not None else None,
             published_at=raw.published_at,
             summary=raw.summary,
             image_url=raw.image_url,

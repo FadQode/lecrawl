@@ -232,3 +232,16 @@ def test_main_writes_a_timestamped_file_into_a_directory(
     assert len(payload) == 2
     assert payload[0]["text"].startswith("TEXT-BEGIN")
     assert "records written to" in capsys.readouterr().out
+
+
+def test_bilingual_flag_and_secondary_listing_reach_the_actor() -> None:
+    """### The localization options are wired from the CLI and settings."""
+    settings = build_settings(crawl_bilingual=False, listings_secondary_url="https://listing.example.test/en/news")
+    without_flag = build_actor("uae", parse(["crawl"]), settings)
+    with_flag = build_actor("uae", parse(["crawl", "--bilingual"]), settings)
+
+    assert isinstance(without_flag, UaeLegislationActor)
+    assert isinstance(with_flag, UaeLegislationActor)
+    assert without_flag.bilingual is False
+    assert with_flag.bilingual is True
+    assert with_flag.secondary_listing_url == "https://listing.example.test/en/news"

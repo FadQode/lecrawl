@@ -14,14 +14,29 @@ from bs4.element import Tag
 
 from lexcrawl.actors.base import Actor, ActorRunResult
 from lexcrawl.config import required_setting
-from lexcrawl.crawling.base import Fetcher, FetchError
+from lexcrawl.crawling.base import AccessBlockedError, Fetcher, FetchError
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import ArticleContentError, ArticleStub, CanonicalDocument, RawArticle
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
+from lexcrawl.validation.uae import (
+    PRIMARY_LANGUAGE,
+    ExtractionStatus,
+    Language,
+    UAEArticle,
+    UAEArticleLocalization,
+    article_key_from_url,
+    metadata_document,
+    to_canonical,
+    translated_article_url,
+    validate_article,
+    validate_listing_entry,
+    validate_localization,
+)
 
 LOGGER = get_logger(__name__)
 
 SOURCE_NAME = "uae_legislation_news"
+SECONDARY_LANGUAGE: Language = "en"
 
 # $ Selectors observed in the saved listing snapshot for this source.$
 CARD_SELECTOR = ".item_"
@@ -55,13 +70,23 @@ class ListingPage:
     duplicate_urls: int = 0
 
 
-@dataclass(slots=True)
-class _DetailOutcome:
-    """### Result of fetching and parsing a single article page."""
+@dataclass(frozen=True, slots=True)
+class _LocalizationOutcome:
+    """### Result of collecting one language variant of an article."""
 
-    article: RawArticle | None = None
-    error: str | None = None
+    localization: UAEArticleLocalization
+    collected_text: bool
+    message: str | None = None
     missing_required_fields: bool = False
+
+
+@dataclass(slots=True)
+class _ArticleOutcome:
+    """### Assembled bilingual article plus the outcome of each localization."""
+
+    article: UAEArticle | None = None
+    localizations: tuple[_LocalizationOutcome, ...] = ()
+    issues: tuple[str, ...] = ()
 
 
 def _soup(html: bytes | str) -> BeautifulSoup:
@@ -227,7 +252,7 @@ def _detail_image_url(soup: BeautifulSoup, url: str) -> str | None:
 
 
 class UaeLegislationActor(Actor):
-    """### Crawl UAE Legislation news and emit canonical documents."""
+    """### Collect UAE news articles with validated Arabic and English localizations."""
 
     name = SOURCE_NAME
 
@@ -238,25 +263,42 @@ class UaeLegislationActor(Actor):
         language: str = "",
         max_listing_pages: int = 25,
         concurrency: int = 1,
+        bilingual: bool = False,
+        secondary_listing_url: str = "",
         source_name: str = SOURCE_NAME,
     ) -> None:
-        """### Configure the actor's listing entry point and crawl bounds."""
+        """### Configure the listing entry points, bounds, and localization mode."""
         self.listing_url = required_setting(listing_url, name="LISTINGS_URL")
-        self.article_host, self.article_path_prefix = article_scope(self.listing_url)
         self.language = language
         self.max_listing_pages = max_listing_pages
         self.concurrency = max(1, concurrency)
+        self.bilingual = bilingual
+        self.secondary_listing_url = (secondary_listing_url or "").strip()
         self.source_name = source_name
+        self.article_host, self.article_path_prefix = article_scope(self.listing_url)
         self._logger = get_logger(f"{__name__}.{source_name}")
 
     def run(self, fetcher: Fetcher) -> ActorRunResult:
-        """### Run listing pagination then detail extraction, reporting counters."""
+        """### Discover, validate, localize, and assemble this source's articles."""
         started_at = time.monotonic()
         result = ActorRunResult(source=self.source_name)
-        discovered: dict[str, ArticleStub] = {}
+        discovered: dict[str, dict[str, ArticleStub]] = {}
 
-        result.pagination_complete = self._walk_listing(fetcher, discovered, result)
-        self._collect_details(fetcher, list(discovered.values()), result)
+        complete = self._walk_listing(
+            fetcher, discovered, result, listing_url=self.listing_url, language=PRIMARY_LANGUAGE
+        )
+        if complete and self.bilingual and self.secondary_listing_url:
+            secondary = self._walk_listing(
+                fetcher,
+                discovered,
+                result,
+                listing_url=self.secondary_listing_url,
+                language=SECONDARY_LANGUAGE,
+            )
+            complete = complete and secondary
+        result.pagination_complete = complete
+
+        self._collect_details(fetcher, discovered, result)
 
         result.duration_seconds = time.monotonic() - started_at
         self._logger.info(
@@ -266,15 +308,26 @@ class UaeLegislationActor(Actor):
                 "status": result.status,
                 "documents": len(result.documents),
                 "errors": len(result.errors),
+                "bilingual": self.bilingual,
                 "pagination_complete": result.pagination_complete,
             },
         )
         return result
 
-    def _walk_listing(self, fetcher: Fetcher, discovered: dict[str, ArticleStub], result: ActorRunResult) -> bool:
-        """### Follow listing pagination, returning whether it ran to completion."""
+    def _walk_listing(
+        self,
+        fetcher: Fetcher,
+        discovered: dict[str, dict[str, ArticleStub]],
+        result: ActorRunResult,
+        *,
+        listing_url: str,
+        language: Language,
+    ) -> bool:
+        """### Walk one language's listing, validating records before enrichment."""
         visited: set[str] = set()
-        page_url: str | None = self.listing_url
+        page_url: str | None = listing_url
+        # $ Each listing page defines its own article scope, so the secondary language works.$
+        page_host, page_prefix = article_scope(listing_url)
         while page_url is not None:
             if page_url in visited:
                 result.add_error(f"pagination loop detected at {page_url}")
@@ -289,8 +342,8 @@ class UaeLegislationActor(Actor):
                 page = parse_listing(
                     fetcher.fetch(page_url).content,
                     page_url,
-                    host=self.article_host,
-                    path_prefix=self.article_path_prefix,
+                    host=page_host,
+                    path_prefix=page_prefix,
                 )
             except FetchError as error:
                 result.listing_pages_failed += 1
@@ -306,58 +359,221 @@ class UaeLegislationActor(Actor):
             if page.skipped_cards:
                 result.add_error(f"skipped {page.skipped_cards} malformed card(s) on {page_url}")
             for stub in page.stubs:
-                if stub.url in discovered:
+                problem = validate_listing_entry(
+                    title=stub.title,
+                    article_url=stub.url,
+                    listing_url=page_url,
+                    language=language,
+                    expected_host=self.article_host,
+                )
+                if not problem.ok:
+                    details = "; ".join(f"{issue.code}: {issue.message}" for issue in problem.errors)
+                    result.add_error(f"rejected listing record at {stub.url}: {details}")
+                    continue
+                key = article_key_from_url(stub.url)
+                entry = discovered.setdefault(key, {})
+                if language in entry:
                     result.article_urls_deduplicated += 1
                     continue
-                discovered[stub.url] = stub
+                entry[language] = stub
             result.articles_discovered = len(discovered)
             page_url = page.next_page_url
         return True
 
-    def _collect_details(self, fetcher: Fetcher, stubs: list[ArticleStub], result: ActorRunResult) -> None:
-        """### Fetch and extract every discovered article, keeping listing metadata."""
-        if not stubs:
+    def _collect_details(
+        self,
+        fetcher: Fetcher,
+        discovered: dict[str, dict[str, ArticleStub]],
+        result: ActorRunResult,
+    ) -> None:
+        """### Localize every discovered article, preserving each language outcome."""
+        if not discovered:
             result.add_error("no article URLs discovered on the listing pages")
             return
-        outcomes = self._extract_articles(fetcher, stubs)
-        for stub, outcome in zip(stubs, outcomes, strict=True):
-            result.detail_pages_attempted += 1
-            if outcome.error:
-                result.add_error(outcome.error)
+        outcomes = self._extract_articles(fetcher, list(discovered.items()))
+        for outcome in outcomes:
+            for localized in outcome.localizations:
+                result.detail_pages_attempted += 1
+                if localized.collected_text:
+                    result.detail_pages_succeeded += 1
+                else:
+                    result.detail_pages_failed += 1
+                    if localized.missing_required_fields:
+                        result.records_missing_required_fields += 1
+                if localized.message:
+                    result.add_error(localized.message)
+            for issue in outcome.issues:
+                result.add_error(issue)
             if outcome.article is None:
-                result.detail_pages_failed += 1
-                if outcome.missing_required_fields:
-                    result.records_missing_required_fields += 1
-                # $ Discovery metadata is still worth storing when the article body is unavailable.$
-                result.records_without_text += 1
-                result.documents.append(
-                    CanonicalDocument.from_listing_entry(stub, source=self.source_name, language=self.language)
-                )
                 continue
-            result.detail_pages_succeeded += 1
-            result.documents.append(CanonicalDocument.from_raw(outcome.article))
+            document = to_canonical(outcome.article)
+            if document is None:
+                result.records_without_text += 1
+                document = metadata_document(outcome.article)
+            result.documents.append(document)
 
-    def _extract_articles(self, fetcher: Fetcher, stubs: list[ArticleStub]) -> list[_DetailOutcome]:
-        """### Extract articles in order, staying single-threaded when unpooled."""
+    def _extract_articles(
+        self,
+        fetcher: Fetcher,
+        items: list[tuple[str, dict[str, ArticleStub]]],
+    ) -> list[_ArticleOutcome]:
+        """### Extract items in order, staying single-threaded when unpooled."""
         if self.concurrency == 1:
-            return [self._extract_article(fetcher, stub) for stub in stubs]
+            return [self._extract_article(fetcher, key, stubs) for key, stubs in items]
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            return list(pool.map(partial(self._extract_article, fetcher), stubs))
+            return list(pool.map(partial(self._extract_article, fetcher), *(zip(*items, strict=True))))
 
-    def _extract_article(self, fetcher: Fetcher, stub: ArticleStub) -> _DetailOutcome:
-        """### Fetch one article page and convert it into a raw contract record."""
+    def _extract_article(
+        self,
+        fetcher: Fetcher,
+        key: str,
+        stubs: dict[str, ArticleStub],
+    ) -> _ArticleOutcome:
+        """### Collect both localizations of one article and validate the assembly."""
+        issues: list[str] = []
+        outcomes: list[_LocalizationOutcome] = []
+        built: dict[str, UAEArticleLocalization] = {}
+
+        languages: list[Language] = [PRIMARY_LANGUAGE]
+        if self.bilingual:
+            languages.append(SECONDARY_LANGUAGE)
+        for language in languages:
+            stub = self._stub_for(key, stubs, language)
+            outcome = self._collect_localization(
+                fetcher,
+                stub=stub,
+                language=language,
+                listing_url=self._listing_for(language),
+            )
+            outcomes.append(outcome)
+            built[language] = outcome.localization
+            if outcome.message:
+                issues.append(outcome.message)
+            report = validate_localization(outcome.localization, expected_host=self.article_host)
+            if not report.ok:
+                details = "; ".join(f"{issue.code}: {issue.message}" for issue in report.errors)
+                issues.append(f"{stub.url} [{language}] localization rejected: {details}")
+                built[language] = outcome.localization.model_copy(
+                    update={"extraction_status": "failed", "text": None, "content_hash": None}
+                )
+
+        if PRIMARY_LANGUAGE not in built:
+            issues.append(f"{key}: primary localization could not be built")
+            return _ArticleOutcome(article=None, localizations=tuple(outcomes), issues=tuple(issues))
+        try:
+            article = UAEArticle(
+                article_key=key,
+                primary=built[PRIMARY_LANGUAGE],
+                translations={
+                    language: localization for language, localization in built.items() if language != PRIMARY_LANGUAGE
+                },
+            )
+        except ValueError as error:
+            return _ArticleOutcome(
+                article=None,
+                localizations=tuple(outcomes),
+                issues=(*issues, f"{key}: article could not be assembled: {error}"),
+            )
+
+        final = validate_article(article, expected_host=self.article_host)
+        issues.extend(
+            f"{key} {issue.field} {issue.code}: {issue.message}" for issue in (*final.errors, *final.warnings)
+        )
+        return _ArticleOutcome(article=article, localizations=tuple(outcomes), issues=tuple(issues))
+
+    def _collect_localization(
+        self,
+        fetcher: Fetcher,
+        *,
+        stub: ArticleStub,
+        language: Language,
+        listing_url: str | None,
+    ) -> _LocalizationOutcome:
+        """### Fetch one language variant and record the actual extraction outcome."""
         try:
             page = fetcher.fetch(stub.url)
+            article = parse_detail(page.content, stub.url, source=self.source_name, language=language)
+        except AccessBlockedError as error:
+            return self._uncollected(
+                stub, language, listing_url, "access_blocked", f"article fetch failed at {stub.url}: {error}"
+            )
         except FetchError as error:
-            return _DetailOutcome(error=f"article fetch failed at {stub.url}: {error}")
-        try:
-            article = parse_detail(page.content, stub.url, source=self.source_name, language=self.language)
+            status: ExtractionStatus = "unavailable" if getattr(error, "status_code", None) in {404, 410} else "failed"
+            return self._uncollected(
+                stub, language, listing_url, status, f"article fetch failed at {stub.url}: {error}"
+            )
         except ArticleContentError as error:
-            return _DetailOutcome(error=f"article parse failed at {stub.url}: {error}", missing_required_fields=True)
-        if stub.summary and not article.summary:
-            article.summary = stub.summary
-        if stub.published_at and article.published_at is None:
-            article.published_at = stub.published_at
-        if stub.image_url and not article.image_url:
-            article.image_url = stub.image_url
-        return _DetailOutcome(article=article)
+            return self._uncollected(
+                stub,
+                language,
+                listing_url,
+                "failed",
+                f"article parse failed at {stub.url}: {error}",
+                missing_required_fields=True,
+            )
+
+        document = CanonicalDocument.from_raw(article)
+        localization = UAEArticleLocalization(
+            language=language,
+            article_url=stub.url,
+            listing_url=listing_url,
+            title=article.title,
+            published_at=article.published_at or stub.published_at,
+            summary=article.summary or stub.summary,
+            image_url=article.image_url or stub.image_url,
+            text=document.text,
+            content_hash=document.content_hash,
+            extraction_status="complete",
+        )
+        return _LocalizationOutcome(localization=localization, collected_text=True)
+
+    def _uncollected(
+        self,
+        stub: ArticleStub,
+        language: Language,
+        listing_url: str | None,
+        status: ExtractionStatus,
+        message: str,
+        *,
+        missing_required_fields: bool = False,
+    ) -> _LocalizationOutcome:
+        """### Record a localization whose text could not be collected."""
+        localization = UAEArticleLocalization.model_validate(
+            {
+                "language": language,
+                "article_url": stub.url,
+                "listing_url": listing_url,
+                "title": stub.title,
+                "published_at": stub.published_at,
+                "summary": stub.summary,
+                "image_url": stub.image_url,
+                "text": None,
+                "content_hash": None,
+                "extraction_status": status,
+            }
+        )
+        return _LocalizationOutcome(
+            localization=localization,
+            collected_text=False,
+            message=message,
+            missing_required_fields=missing_required_fields,
+        )
+
+    def _stub_for(self, key: str, stubs: dict[str, ArticleStub], language: Language) -> ArticleStub:
+        """### Return the listing stub for a language, deriving it when absent."""
+        if language in stubs:
+            return stubs[language]
+        source_stub = next(iter(stubs.values()))
+        return ArticleStub(
+            url=translated_article_url(source_stub.url, target_language=language),
+            title=source_stub.title,
+            published_at=source_stub.published_at,
+            summary=None,
+            image_url=source_stub.image_url,
+        )
+
+    def _listing_for(self, language: Language) -> str | None:
+        """### Return the listing URL that discovered a language variant."""
+        if language == PRIMARY_LANGUAGE:
+            return self.listing_url
+        return self.secondary_listing_url or None

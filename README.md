@@ -62,6 +62,10 @@ src/lexcrawl/
 │   ├── pacing.py                # request pacing shared by both strategies
 │   └── robots.py                # robots.txt policy shared by both strategies
 ├── models/document.py           # ArticleStub, RawArticle, CanonicalDocument, TEXT-BEGIN marker
+├── validation/
+│   ├── base.py                  # shared URL/text/hash validation rules and reports
+│   ├── uae.py                   # UAE article/localization contract, validators, canonical adapter
+│   └── cba.py                   # CBA release/resource contract, validators, canonical adapter
 ├── pipeline/normalize.py        # shared whitespace and paragraph extraction
 ├── pipeline/pdf.py              # PyMuPDF extraction for linked resources
 ├── orchestrator.py              # runs actors in isolation, aggregates the run report
@@ -92,7 +96,7 @@ uv run lexcrawl crawl --source uae --engine browser --headed        # watch the 
 uv run lexcrawl crawl --source all --max-pages 2                    # every registered source
 ```
 
-Flags: `--source {uae,commerce,all}`, `--engine {http,browser}`, `--headed`, `--max-pages`,
+Flags: `--source {uae,commerce,cba,all}`, `--engine {http,browser}`, `--headed`, `--bilingual`, `--max-pages`,
 `--request-delay`, `--timeout`, `--max-retries`, `--concurrency`, `--no-robots`, `--out`,
 `--log-level`, `--log-format`. The browser engine forces `--concurrency 1` because a
 Playwright driver is single-threaded; the runner fails loudly if a browser fetcher is used
@@ -125,6 +129,39 @@ records at all, so an empty file can never be mistaken for collected data.
   stays `null` instead of failing the article.
 - Arabic and Unicode text is preserved verbatim; no translation, transliteration, or
   normalization beyond whitespace collapsing.
+
+#### Validation and bilingual localizations
+
+The UAE source validates data in three stages, all inside the normal crawl:
+
+1. **Listing records** are validated before enrichment (title, absolute in-scope URL, URL language
+   prefix matching the listing language). Rejected records are reported and never fetched.
+2. **Each localization** is validated independently after its own fetch, so a failure in one
+   language never discards the other. Statuses are explicit: `complete`, `access_blocked`
+   (a denial such as HTTP 403), `failed` (fetch or parse failure), `unavailable` (confirmed
+   missing, e.g. HTTP 404), `pending` (not attempted). A 403 is never recorded as `unavailable`.
+3. **Content** is checked per language: text must be non-empty, start with `TEXT-BEGIN`, and its
+   `content_hash` must equal the shared `compute_content_hash` of that text — the same helper the
+   canonical model uses, so there is no second hashing scheme.
+
+Each article is assembled as a `UAEArticle` source contract: a language-independent
+`article_key` (the shared slug), an Arabic `primary` localization, and optional `translations`
+(English). Each localization keeps its own listing URL, article URL, title, date, summary, image,
+text, hash, and status, and metadata differences between languages are preserved and reported as
+warnings rather than silently reconciled.
+
+Arabic is the primary representation. The English URL is derived from the verified
+language-prefix relationship (`/ar/news/<slug>` ↔ `/en/news/<slug>`), and an optional secondary
+listing (`LISTINGS_SECONDARY_URL`) can also be walked so both listings contribute without
+duplicating an article. Bilingual collection is off by default (`CRAWL_BILINGUAL=false`,
+`--bilingual`); with it off the source behaves exactly as before.
+
+Downstream, `CanonicalDocument` gained a backward-compatible `translations` tuple
+(`DocumentTranslation`: language, URL, title, text, hash, date, summary, image). When Arabic
+completes, it is the canonical body and English is attached as a translation; if Arabic is
+blocked but English completed, the English localization is stored as the document body with its
+own URL, hash, and `TEXT-BEGIN` text. Rows whose localizations all failed keep discovery metadata
+with `text: null`. Existing sources are unaffected because the field defaults to empty.
 
 ### U.S. Department of Commerce reports
 
@@ -179,6 +216,39 @@ records at all, so an empty file can never be mistaken for collected data.
   empty text.
 - Article pages that cannot be fetched or parsed still produce a stored row with the discovery
   metadata (`text: null`, `type_of_law: News Releases`), counted as `metadata_only`.
+
+#### Release contract and resource validation
+
+The CBA source has an explicit contract (`validation/cba.py`), validated inside the crawl:
+
+- `CbaNewsRelease`: fixed `source`, `source_url`, non-empty `title`, fixed
+  `document_type` ("News Releases"), optional `native_id`, `published_at`, `topics`, `summary`,
+  `text`, `content_hash`, `image_url`, and `resources`.
+- `CbaResource`: `title`, optional `original_url`, `resource_type` (`pdf`, `excel`, `word`, `csv`,
+  `other`), `mime_type`, `file_size`, `extracted_text`, `content_hash`, `extraction_status`
+  (`pending`, `complete`, `not_applicable`, `access_blocked`, `failed`, `url_unavailable`), plus a
+  generated `display_title` and `error`.
+
+Rules: source/document type must match, the URL must be absolute and in scope, topics are
+normalized (stripped, de-duplicated, order kept), and the article body is checked with the shared
+content rules — non-empty when present, `TEXT-BEGIN` prefix, and a hash equal to
+`compute_content_hash(text)`. A release without body text is a valid *incomplete* record, never a
+failed one.
+
+Each resource is validated independently, so a bad attachment never invalidates the release or
+its siblings: a PDF marked `complete` needs its own marked text and hash; Excel and other
+attachments are `not_applicable` and need no extraction; a resource whose URL cannot be resolved
+keeps its filename metadata and is marked `url_unavailable` (no URL is ever invented).
+
+Multiple PDFs are processed one by one, each with its own URL, text, and hash, and each gets a
+`display_title` of the form `Title [file.pdf]` so the resulting documents are distinguishable
+while the original title is preserved.
+
+The article body and the PDF texts stay separate: attached resources are nested under the parent
+document (`CanonicalDocument.resources`), which keeps the relationship intact and never mixes PDF
+text into the article text. The canonical model's `DocumentResource` gained optional
+`display_title`, `mime_type`, `file_size`, `content_hash`, and `status` fields (all defaulted, so
+UAE and Commerce are unaffected).
 
 ### Courtesy and reliability
 
