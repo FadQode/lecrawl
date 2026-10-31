@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from collections.abc import Callable
+from multiprocessing import get_context
+from multiprocessing.connection import Connection
 from pathlib import PurePosixPath
 
 import pymupdf
@@ -45,13 +46,57 @@ def extract_pdf_text(payload: bytes, *, max_bytes: int, timeout_seconds: float =
     if not payload.startswith(PDF_MAGIC):
         raise PdfExtractionError("payload does not start with a PDF header")
 
-    # $ Bound the extraction so a hostile document cannot stall the crawl.$
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_read_document_text, payload)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except FutureTimeoutError as error:
-            raise PdfExtractionError(f"pdf extraction timed out after {timeout_seconds}s") from error
+    return _run_bounded_extraction(payload, timeout_seconds=timeout_seconds, extractor=_read_document_text)
+
+
+def _run_bounded_extraction(
+    payload: bytes,
+    *,
+    timeout_seconds: float,
+    extractor: Callable[[bytes], str],
+) -> str:
+    """### Run extraction in a process that can be terminated on timeout."""
+    context = get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_extract_worker, args=(sender, payload, extractor), daemon=True)
+    process.start()
+    sender.close()
+    try:
+        if not receiver.poll(timeout_seconds):
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            raise PdfExtractionError(f"pdf extraction timed out after {timeout_seconds}s")
+        succeeded, result = receiver.recv()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        if not succeeded:
+            raise PdfExtractionError(f"pdf could not be parsed: {result}")
+        if not isinstance(result, str):
+            raise PdfExtractionError("pdf extraction worker returned an invalid result")
+        return result
+    except (EOFError, OSError) as error:
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        raise PdfExtractionError("pdf extraction worker exited without a result") from error
+    finally:
+        receiver.close()
+
+
+def _extract_worker(connection: Connection, payload: bytes, extractor: Callable[[bytes], str]) -> None:
+    """### Send an extraction result to the parent process without sharing state."""
+    try:
+        connection.send((True, extractor(payload)))
+    except Exception as error:  # $ Child-process failures return a simple serializable message.$
+        connection.send((False, str(error)))
+    finally:
+        connection.close()
 
 
 def _read_document_text(payload: bytes) -> str:

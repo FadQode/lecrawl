@@ -7,7 +7,7 @@ from collections.abc import Iterator
 import pytest
 
 from lexcrawl.config import Settings
-from lexcrawl.crawling.base import FetchedPage, FetchError
+from lexcrawl.crawling.base import FetchedPage, FetchError, ResponseTooLargeError
 
 
 class StubFetcher:
@@ -40,9 +40,12 @@ class StubFetcher:
             raise FetchError("no canned payload for URL", url=url)
         return FetchedPage(url=url, status_code=200, content=self._pages[url], content_type=self._content_type)
 
-    def fetch_binary(self, url: str) -> FetchedPage:
+    def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
         """### Return a canned payload as raw bytes."""
-        return self.fetch(url)
+        page = self.fetch(url)
+        if max_bytes is not None and len(page.content) > max_bytes:
+            raise ResponseTooLargeError("response exceeds the download limit", url=url)
+        return page
 
     def post_json(self, url: str, *, payload: str) -> FetchedPage:
         """### Return the next canned response for a JSON POST."""

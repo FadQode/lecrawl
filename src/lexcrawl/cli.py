@@ -7,6 +7,7 @@ import json
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from lexcrawl.actors.base import Actor
 from lexcrawl.actors.cba import CbaNewsReleasesActor
@@ -129,6 +130,26 @@ def robots_enabled(arguments: argparse.Namespace, settings: Settings) -> bool:
     return settings.crawl_respect_robots_txt and not arguments.no_robots
 
 
+def redirect_host_allowlist(settings: Settings) -> tuple[str, ...]:
+    """### Allow redirects among explicitly configured source hosts and their www aliases."""
+    configured = (
+        settings.listings_url,
+        settings.listings_secondary_url,
+        settings.reports_api_url,
+        settings.reports_article_host,
+        settings.releases_api_url,
+        settings.releases_site_url,
+    )
+    hosts: set[str] = set()
+    for value in configured:
+        host = (urlparse(value).hostname or value).lower().rstrip(".")
+        if not host:
+            continue
+        hosts.add(host)
+        hosts.add(host[4:] if host.startswith("www.") else f"www.{host}")
+    return tuple(sorted(hosts))
+
+
 def build_fetcher(arguments: argparse.Namespace, settings: Settings) -> Fetcher:
     """### Build the crawling strategy selected by the CLI or settings."""
     if crawl_engine(arguments, settings) == "browser":
@@ -139,6 +160,8 @@ def build_fetcher(arguments: argparse.Namespace, settings: Settings) -> Fetcher:
             backoff_seconds=settings.crawl_retry_backoff_seconds,
             request_delay_seconds=request_delay(arguments, settings),
             respect_robots_txt=robots_enabled(arguments, settings),
+            allowed_redirect_hosts=redirect_host_allowlist(settings),
+            max_response_bytes=settings.pdf_max_bytes,
             headless=settings.browser_headless and not arguments.headed,
             wait_until=settings.browser_wait_until,
             settle_milliseconds=settings.browser_settle_milliseconds,
@@ -150,6 +173,8 @@ def build_fetcher(arguments: argparse.Namespace, settings: Settings) -> Fetcher:
         backoff_seconds=settings.crawl_retry_backoff_seconds,
         request_delay_seconds=request_delay(arguments, settings),
         respect_robots_txt=robots_enabled(arguments, settings),
+        allowed_redirect_hosts=redirect_host_allowlist(settings),
+        max_response_bytes=settings.pdf_max_bytes,
     )
 
 

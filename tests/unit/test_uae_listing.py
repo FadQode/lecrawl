@@ -106,6 +106,15 @@ def test_listing_ignores_pagination_links_without_a_target() -> None:
     assert parse_listing(html, LISTING_URL).next_page_url is None
 
 
+def test_listing_rejects_pagination_targets_outside_the_listing_origin() -> None:
+    """### A next link cannot send the crawl to a foreign host or unrelated path."""
+    foreign = "https://attacker.example/ar/news?page=2"
+    unrelated = f"https://{LISTING_HOST}/admin?page=2"
+    for target in (foreign, unrelated):
+        html = f'<div class="table_pagination"><a class="next_" href="{target}">next</a></div>'
+        assert parse_listing(html, LISTING_URL).next_page_url is None
+
+
 def test_is_article_url_rejects_out_of_scope_urls() -> None:
     """### Only same-host `/ar/news/<slug>` URLs are considered in scope."""
     scope = {"host": LISTING_HOST, "path_prefix": "/ar/news/"}

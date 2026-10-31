@@ -8,17 +8,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 
 from lexcrawl.crawling.base import (
     RETRYABLE_STATUS_CODES,
     AccessBlockedError,
     FetchedPage,
+    Fetcher,
     FetchError,
+    ResponseTooLargeError,
     TransientFetchError,
     detect_bot_block,
 )
+from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.crawling.pacing import RequestPacer
+from lexcrawl.crawling.retry import parse_retry_after, retry_delay
 from lexcrawl.crawling.robots import RobotsFile, RobotsPolicy
 from lexcrawl.logging import get_logger
 
@@ -35,6 +39,7 @@ class RenderedPage:
     url: str
     status_code: int | None
     html: str
+    retry_after: str | None = None
 
 
 @runtime_checkable
@@ -47,10 +52,6 @@ class BrowserSession(Protocol):
 
     def read_text(self, url: str) -> RobotsFile:
         """### Retrieve a plain-text resource without rendering it."""
-        ...
-
-    def read_bytes(self, url: str) -> RobotsFile:
-        """### Retrieve a binary resource without rendering it."""
         ...
 
     def close(self) -> None:
@@ -92,7 +93,8 @@ class PlaywrightBrowserSession:
         if self._settle_seconds:
             page.wait_for_timeout(int(self._settle_seconds * 1000))
         status_code = response.status if response is not None else None
-        return RenderedPage(url=page.url, status_code=status_code, html=page.content())
+        retry_after = response.headers.get("retry-after") if response is not None else None
+        return RenderedPage(url=page.url, status_code=status_code, html=page.content(), retry_after=retry_after)
 
     def read_text(self, url: str) -> RobotsFile:
         """### Retrieve a plain-text resource without rendering it."""
@@ -102,15 +104,6 @@ class PlaywrightBrowserSession:
         except Exception as error:  # $ The driver reports unreachable resources as exceptions.$
             return RobotsFile(error=str(error))
         return RobotsFile(status_code=response.status, text=response.text() if response.status == 200 else None)
-
-    def read_bytes(self, url: str) -> RobotsFile:
-        """### Retrieve a binary resource through the browser's request context."""
-        context = self._ensure_context()
-        try:
-            response = context.request.get(url, timeout=self._timeout_milliseconds)
-        except Exception as error:  # $ The driver reports unreachable resources as exceptions.$
-            return RobotsFile(error=str(error))
-        return RobotsFile(status_code=response.status, text=response.body().decode("latin-1"))
 
     def close(self) -> None:
         """### Close the browser, its context, and the driver."""
@@ -159,10 +152,13 @@ class BrowserFetcher:
         backoff_seconds: float = 1.5,
         request_delay_seconds: float = 0.0,
         respect_robots_txt: bool = True,
+        allowed_redirect_hosts: tuple[str, ...] = (),
+        max_response_bytes: int = 26_214_400,
         headless: bool = True,
         wait_until: WaitUntil = "domcontentloaded",
         settle_milliseconds: int = 250,
         session: BrowserSession | None = None,
+        binary_fetcher: Fetcher | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -171,9 +167,9 @@ class BrowserFetcher:
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep
         self._respect_robots_txt = respect_robots_txt
+        self._max_response_bytes = max(1, max_response_bytes)
         self._pacer = RequestPacer(request_delay_seconds, sleep=sleep, monotonic=monotonic)
         self._cache: dict[str, FetchedPage] = {}
-        self._binary_cache: dict[str, FetchedPage] = {}
         self._owner_thread: int | None = None
         self._logger = get_logger(__name__)
         self._owns_session = session is None
@@ -184,12 +180,25 @@ class BrowserFetcher:
             settle_milliseconds=settle_milliseconds,
             user_agent=user_agent or None,
         )
+        self._owns_binary_fetcher = binary_fetcher is None
+        self._binary_fetcher = binary_fetcher or HttpFetcher(
+            user_agent=user_agent,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            backoff_seconds=backoff_seconds,
+            request_delay_seconds=request_delay_seconds,
+            respect_robots_txt=respect_robots_txt,
+            allowed_redirect_hosts=allowed_redirect_hosts,
+            max_response_bytes=self._max_response_bytes,
+        )
         self._robots = RobotsPolicy(self._session.read_text, user_agent=user_agent)
 
     def close(self) -> None:
         """### Close the browser session when this fetcher owns it."""
         if self._owns_session:
             self._session.close()
+        if self._owns_binary_fetcher:
+            self._binary_fetcher.close()
 
     def __enter__(self) -> BrowserFetcher:
         """### Support use as a context manager."""
@@ -199,27 +208,11 @@ class BrowserFetcher:
         """### Close the session when leaving the context."""
         self.close()
 
-    def fetch_binary(self, url: str) -> FetchedPage:
+    def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
         """### Retrieve raw bytes without rendering, for payloads such as PDFs."""
         self._assert_single_thread()
-        cached = self._binary_cache.get(url)
-        if cached is not None:
-            return cached
-        if self._respect_robots_txt:
-            self._robots.assert_allowed(url)
-        self._pacer.wait_for_slot()
-        result = self._session.read_bytes(url)
-        if result.error is not None:
-            raise TransientFetchError(f"binary fetch failed: {result.error}", url=url)
-        if result.status_code is None or result.status_code >= 400:
-            raise FetchError(f"unexpected status {result.status_code}", url=url, status_code=result.status_code)
-        page = FetchedPage(
-            url=url,
-            status_code=result.status_code,
-            content=(result.text or "").encode("latin-1"),
-        )
-        self._binary_cache[url] = page
-        return page
+        limit = self._max_response_bytes if max_bytes is None else min(max_bytes, self._max_response_bytes)
+        return self._binary_fetcher.fetch_binary(url, max_bytes=limit)
 
     def post_json(self, url: str, *, payload: str) -> FetchedPage:
         """### Refuse to post JSON, because a rendering engine cannot serve a feed."""
@@ -249,10 +242,19 @@ class BrowserFetcher:
 
     def _fetch_once_with_retries(self, url: str) -> FetchedPage:
         """### Render the page with bounded retries for transient failures."""
+
+        def wait(retry_state: object) -> float:
+            """### Choose jittered backoff while honoring a server retry hint."""
+            attempt = getattr(retry_state, "attempt_number", 1)
+            outcome = getattr(retry_state, "outcome", None)
+            error = outcome.exception() if outcome is not None else None
+            retry_after = error.retry_after_seconds if isinstance(error, TransientFetchError) else None
+            return retry_delay(attempt, backoff_seconds=self._backoff_seconds, retry_after_seconds=retry_after)
+
         retryer = Retrying(
             retry=retry_if_exception_type(TransientFetchError),
             stop=stop_after_attempt(self._max_retries + 1),
-            wait=wait_exponential(multiplier=self._backoff_seconds, min=self._backoff_seconds, max=30.0),
+            wait=wait,
             sleep=self._sleep,
             reraise=True,
         )
@@ -266,6 +268,12 @@ class BrowserFetcher:
         self._pacer.wait_for_slot()
         rendered = self._session.render(url)
         content = rendered.html.encode("utf-8")
+        if len(content) > self._max_response_bytes:
+            raise ResponseTooLargeError(
+                f"rendered document exceeds the {self._max_response_bytes} byte limit",
+                url=url,
+                status_code=rendered.status_code,
+            )
 
         block_reason = detect_bot_block(rendered.status_code, content)
         if block_reason is not None:
@@ -277,7 +285,10 @@ class BrowserFetcher:
             )
         if rendered.status_code in RETRYABLE_STATUS_CODES:
             raise TransientFetchError(
-                f"retryable status {rendered.status_code}", url=url, status_code=rendered.status_code
+                f"retryable status {rendered.status_code}",
+                url=url,
+                status_code=rendered.status_code,
+                retry_after_seconds=parse_retry_after(rendered.retry_after),
             )
         if rendered.status_code is not None and rendered.status_code >= 400:
             raise FetchError(f"unexpected status {rendered.status_code}", url=url, status_code=rendered.status_code)

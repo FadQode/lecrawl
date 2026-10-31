@@ -17,28 +17,22 @@ from lexcrawl.models.document import (
     ensure_text_marker,
 )
 from lexcrawl.validation.base import (
+    RESOURCE_TYPES,
+    ResourceType,
     ValidationIssue,
     ValidationReport,
     host_issue,
     http_url_issue,
+    normalize_resource_type,
     text_issues,
 )
 
 SourceName = Literal["cba_news_releases"]
 DocumentType = Literal["News Releases"]
-ResourceType = Literal["pdf", "excel", "word", "csv", "other"]
 
 SOURCE_NAME: SourceName = "cba_news_releases"
 DOCUMENT_TYPE: DocumentType = "News Releases"
 OUTPUT_LANGUAGE = "en"
-RESOURCE_TYPES: tuple[str, ...] = ("pdf", "excel", "word", "csv", "other")
-_RESOURCE_TYPE_MAP: dict[str, ResourceType] = {
-    "pdf": "pdf",
-    "excel": "excel",
-    "word": "word",
-    "csv": "csv",
-    "other": "other",
-}
 
 
 def normalize_topics(values: object) -> tuple[str, ...]:
@@ -55,11 +49,6 @@ def normalize_topics(values: object) -> tuple[str, ...]:
         if text and text not in normalized:
             normalized.append(text)
     return tuple(normalized)
-
-
-def normalize_resource_type(value: str) -> ResourceType:
-    """### Normalize a detected file kind to a supported resource type."""
-    return _RESOURCE_TYPE_MAP.get(value, "other")
 
 
 def filename_from_url(url: str | None) -> str | None:

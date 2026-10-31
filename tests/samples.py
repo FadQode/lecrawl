@@ -133,6 +133,8 @@ def commerce_record(
     news_types: Sequence[str] = ("Reports",),
     post_date: object = "2026-01-15",
     created: object = 1768435200,
+    documents: Sequence[dict[str, object]] | None = None,
+    image: object = None,
 ) -> dict[str, object]:
     """### Build one reports API record with the verified field names."""
     return {
@@ -148,6 +150,8 @@ def commerce_record(
         "post_date_formatted": None,
         "created": created,
         "updated": created,
+        "documents": list(documents or []),
+        "image": image,
     }
 
 
@@ -273,3 +277,24 @@ def detail_html_en(
         with_container=with_container,
         with_title_block=with_title_block,
     )
+
+
+
+
+
+def commerce_listing_row(
+    *,
+    display_date: str | None = "January 2025",
+    title: str = "Sample Commerce report",
+    slug: str = "sample-commerce-report",
+    year: str = "2025",
+    month: str = "01",
+    pdf_urls: Sequence[str] = COMMERCE_PDF_URLS[:1],
+) -> dict[str, object]:
+    """### Build one archived Commerce listing row."""
+    return {
+        "display_date": display_date,
+        "title": title,
+        "report_url": f"https://www.commerce.gov/data-and-reports/reports/{year}/{month}/{slug}",
+        "pdf_urls": list(pdf_urls),
+    }

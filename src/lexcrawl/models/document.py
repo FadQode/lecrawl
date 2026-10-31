@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -12,6 +12,12 @@ TEXT_BEGIN_MARKER = "TEXT-BEGIN"
 
 # $ Extraction state shared by every linked resource, across sources.$
 ResourceStatus = Literal["pending", "complete", "not_applicable", "access_blocked", "failed", "url_unavailable"]
+
+# $ How precisely a source states a publication date.$
+PublicationPrecision = Literal["day", "month", "year"]
+
+# $ Where a record was obtained: the live source or a public archive.$
+Provenance = Literal["live", "wayback"]
 
 
 class ArticleContentError(ValueError):
@@ -59,6 +65,8 @@ class DocumentResource(BaseModel):
     file_size: int | None = None
     content_hash: str | None = None
     status: ResourceStatus | None = None
+    archive_url: str | None = None
+    archived_at: datetime | None = None
 
     @field_validator("text")
     @classmethod
@@ -131,12 +139,21 @@ class CanonicalDocument(BaseModel):
     text: str | None = None
     content_hash: str | None = None
     published_at: date | None = None
+    # $ Month precision is preserved without inventing a day.$
+    published_month: int | None = Field(default=None, ge=1, le=12)
+    published_year: int | None = Field(default=None, ge=1800, le=2100)
+    published_date_raw: str | None = None
+    published_precision: PublicationPrecision | None = None
     summary: str | None = None
     image_url: str | None = None
     type_of_law: str | None = None
     topics: tuple[str, ...] = ()
     resources: tuple[DocumentResource, ...] = ()
     translations: tuple[DocumentTranslation, ...] = ()
+    provenance: Provenance = "live"
+    archive_url: str | None = None
+    archived_at: datetime | None = None
+    archive_listing_url: str | None = None
 
     @classmethod
     def from_raw(cls, raw: RawArticle) -> CanonicalDocument:

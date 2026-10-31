@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import time
+
 import pymupdf
 import pytest
 
-from lexcrawl.pipeline.pdf import PdfExtractionError, extract_pdf_text, is_pdf_resource, resource_kind
+from lexcrawl.pipeline.pdf import (
+    PdfExtractionError,
+    _run_bounded_extraction,
+    extract_pdf_text,
+    is_pdf_resource,
+    resource_kind,
+)
 
 LIMIT = 1_000_000
 
@@ -20,6 +28,12 @@ def build_pdf(*pages: str) -> bytes:
     payload = document.tobytes()
     document.close()
     return payload
+
+
+def slow_extractor(payload: bytes) -> str:
+    """### Simulate a parser that exceeds its enforced time limit."""
+    time.sleep(5)
+    return "too late"
 
 
 def test_pdf_text_is_extracted() -> None:
@@ -66,6 +80,14 @@ def test_oversized_pdf_is_rejected() -> None:
     payload = build_pdf("oversized")
     with pytest.raises(PdfExtractionError, match="limit"):
         extract_pdf_text(payload, max_bytes=len(payload) - 1)
+
+
+def test_pdf_extraction_timeout_terminates_the_worker() -> None:
+    """### A timed-out parser process is terminated instead of keeping the caller blocked."""
+    started = time.monotonic()
+    with pytest.raises(PdfExtractionError, match="timed out"):
+        _run_bounded_extraction(b"%PDF-test", timeout_seconds=0.5, extractor=slow_extractor)
+    assert time.monotonic() - started < 3
 
 
 def test_resource_kinds_are_classified_by_extension() -> None:

@@ -210,10 +210,22 @@ def _next_page_url(soup: BeautifulSoup, page_url: str) -> str | None:
         if not _has_class(anchor, NEXT_PAGE_CLASS):
             continue
         resolved = _resolve_url(page_url, anchor.get("href"))
-        if resolved is None or resolved == page_url:
+        if resolved is None or resolved == page_url or not _is_listing_page_url(resolved, page_url):
             return None
         return resolved
     return None
+
+
+def _is_listing_page_url(candidate_url: str, current_url: str) -> bool:
+    """### Keep pagination on the same host and listing path."""
+    candidate = urlparse(candidate_url)
+    current = urlparse(current_url)
+    current_path = current.path.rstrip("/")
+    return (
+        candidate.scheme in {"http", "https"}
+        and candidate.netloc.lower() == current.netloc.lower()
+        and (candidate.path.rstrip("/") == current_path or candidate.path.startswith(f"{current_path}/"))
+    )
 
 
 def parse_detail(html: bytes | str, url: str, *, source: str = SOURCE_NAME, language: str = "ar") -> RawArticle:

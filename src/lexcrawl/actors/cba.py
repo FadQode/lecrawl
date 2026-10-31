@@ -603,7 +603,7 @@ class CbaNewsReleasesActor(Actor):
                 extraction_status="not_applicable",
             )
         try:
-            page = fetcher.fetch_binary(resource.url)
+            page = fetcher.fetch_binary(resource.url, max_bytes=self.max_pdf_bytes)
             text = extract_pdf_text(
                 page.content,
                 max_bytes=self.max_pdf_bytes,

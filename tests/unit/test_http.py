@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 import respx
@@ -10,6 +12,7 @@ from lexcrawl.crawling.base import (
     AccessBlockedError,
     FetchError,
     NonTextContentError,
+    ResponseTooLargeError,
     RobotsDisallowedError,
     TransientFetchError,
 )
@@ -76,6 +79,19 @@ def test_fetch_retries_transient_status(clock: ClockRecorder) -> None:
 
 
 @respx.mock
+def test_retry_after_delay_is_respected(clock: ClockRecorder) -> None:
+    """### A server-provided Retry-After delay is a floor for retry timing."""
+    route = respx.get(ARTICLE_URL).mock(
+        side_effect=[httpx.Response(429, headers={"retry-after": "4"}), html_response()]
+    )
+    page = build_fetcher(clock, max_retries=1, backoff_seconds=0.1).fetch(ARTICLE_URL)
+
+    assert page.status_code == 200
+    assert route.call_count == 2
+    assert clock.slept == [4.0]
+
+
+@respx.mock
 def test_fetch_raises_after_retries_are_exhausted(clock: ClockRecorder) -> None:
     """### Exhausted retries surface a transient failure."""
     route = respx.get(ARTICLE_URL).mock(return_value=httpx.Response(503))
@@ -111,6 +127,59 @@ def test_fetch_rejects_binary_content(clock: ClockRecorder) -> None:
     )
     with pytest.raises(NonTextContentError):
         build_fetcher(clock).fetch(ARTICLE_URL)
+
+
+@respx.mock
+def test_fetch_rejects_declared_oversized_response_before_reading(clock: ClockRecorder) -> None:
+    """### Content-Length prevents an oversized body from being buffered."""
+    respx.get(ARTICLE_URL).mock(
+        return_value=httpx.Response(200, headers={"content-length": "100", "content-type": "application/pdf"})
+    )
+    fetcher = HttpFetcher(user_agent="LexCrawl-test/0.1", respect_robots_txt=False, max_response_bytes=10)
+
+    with pytest.raises(ResponseTooLargeError, match="10 byte"):
+        fetcher.fetch_binary(ARTICLE_URL)
+
+
+@respx.mock
+def test_fetch_rejects_oversized_stream_without_content_length(clock: ClockRecorder) -> None:
+    """### Streaming bytes are counted when the server omits Content-Length."""
+    respx.get(ARTICLE_URL).mock(
+        return_value=httpx.Response(
+            200, content=b"x" * 20, headers={"content-type": "application/pdf", "transfer-encoding": "chunked"}
+        )
+    )
+    fetcher = HttpFetcher(user_agent="LexCrawl-test/0.1", respect_robots_txt=False, max_response_bytes=10)
+
+    with pytest.raises(ResponseTooLargeError, match="10 byte"):
+        fetcher.fetch_binary(ARTICLE_URL)
+
+
+@respx.mock
+def test_redirect_to_foreign_host_is_rejected_before_following(clock: ClockRecorder) -> None:
+    """### Redirects stay within the initial source host or configured allowlist."""
+    foreign = "https://other.example.test/document"
+    redirect = respx.get(ARTICLE_URL).mock(return_value=httpx.Response(302, headers={"location": foreign}))
+    destination = respx.get(foreign).mock(return_value=html_response())
+
+    with pytest.raises(FetchError, match="host is not allowed"):
+        build_fetcher(clock).fetch(ARTICLE_URL)
+
+    assert redirect.call_count == 1
+    assert destination.call_count == 0
+
+
+@respx.mock
+def test_redirect_to_configured_source_alias_is_allowed(clock: ClockRecorder) -> None:
+    """### Explicit source aliases can receive redirects without disabling validation."""
+    destination = "https://www.listing.example.test/ar/news/example-article"
+    respx.get(ARTICLE_URL).mock(return_value=httpx.Response(301, headers={"location": destination}))
+    respx.get(destination).mock(return_value=html_response())
+    fetcher = HttpFetcher(
+        user_agent="LexCrawl-test/0.1", respect_robots_txt=False, allowed_redirect_hosts=("www.listing.example.test",)
+    )
+
+    assert fetcher.fetch(ARTICLE_URL).status_code == 200
 
 
 @respx.mock
@@ -153,6 +222,21 @@ def test_fetch_caches_repeated_urls(clock: ClockRecorder) -> None:
     fetcher.fetch(ARTICLE_URL)
     fetcher.fetch(ARTICLE_URL)
     assert route.call_count == 1
+
+
+@respx.mock
+def test_cache_logs_redact_api_credentials(clock: ClockRecorder, caplog: pytest.LogCaptureFixture) -> None:
+    """### Fetcher diagnostics retain safe URL context without logging API keys."""
+    url = f"{ARTICLE_URL}?api_key=secret-value"
+    respx.get(url).mock(return_value=html_response())
+    fetcher = build_fetcher(clock)
+    with caplog.at_level(logging.DEBUG, logger="lexcrawl.crawling.http"):
+        fetcher.fetch(url)
+        fetcher.fetch(url)
+
+    assert "secret-value" not in caplog.text
+    logged_urls = [record.url for record in caplog.records if hasattr(record, "url")]
+    assert logged_urls == [f"{ARTICLE_URL}?api_key=%5BREDACTED%5D"]
 
 
 @respx.mock

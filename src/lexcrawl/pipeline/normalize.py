@@ -28,7 +28,18 @@ def paragraphs_of(container: Tag | None) -> list[str]:
     blocks: list[Tag] = list(container.find_all(_BLOCK_TAGS))
     if not blocks:
         blocks = [container]
-    return [text for block in blocks if (text := text_of(block))]
+    return [text for block in blocks if (text := _block_text(block))]
+
+
+def _block_text(block: Tag) -> str:
+    """### Return a block's own text without repeating nested block contents."""
+    clone = BeautifulSoup(str(block), "lxml")
+    copied_block = clone.find(block.name)
+    if not isinstance(copied_block, Tag):
+        return text_of(block)
+    for nested_block in copied_block.find_all(_BLOCK_TAGS):
+        nested_block.decompose()
+    return text_of(copied_block)
 
 
 def paragraphs_from_html(fragment: str | bytes | None) -> list[str]:

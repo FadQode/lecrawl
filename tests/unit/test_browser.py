@@ -10,6 +10,7 @@ from lexcrawl.crawling.base import (
     AccessBlockedError,
     FetchedPage,
     FetchError,
+    ResponseTooLargeError,
     RobotsDisallowedError,
     TransientFetchError,
 )
@@ -70,6 +71,37 @@ class FakeBrowserSession:
         self.closed = True
 
 
+class FakeBinaryFetcher:
+    """### Serve canned binary responses through the same bounded contract as HTTP."""
+
+    engine_name = "http"
+
+    def __init__(self, session: FakeBrowserSession) -> None:
+        """### Reuse the browser fixture's binary payloads and failures."""
+        self._session = session
+
+    def fetch(self, url: str) -> FetchedPage:
+        """### Refuse unexpected text requests."""
+        raise FetchError("unexpected text request", url=url)
+
+    def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
+        """### Return a canned binary page if it fits within the requested bound."""
+        if url in self._session.binary_errors:
+            raise TransientFetchError(self._session.binary_errors[url], url=url)
+        content = self._session.binary.get(url, "").encode("latin-1")
+        if max_bytes is not None and len(content) > max_bytes:
+            raise ResponseTooLargeError("response exceeds the download limit", url=url)
+        return FetchedPage(url=url, status_code=200, content=content)
+
+    def post_json(self, url: str, *, payload: str) -> FetchedPage:
+        """### Refuse unexpected JSON posts."""
+        raise FetchError("unexpected JSON post", url=url)
+
+    def close(self) -> None:
+        """### Release no resources."""
+        return None
+
+
 def rendered(url: str, html: str = OK_HTML, status_code: int | None = 200) -> RenderedPage:
     """### Build one rendered page."""
     return RenderedPage(url=url, status_code=status_code, html=html)
@@ -83,15 +115,18 @@ def build_fetcher(
     backoff_seconds: float = 0.0,
     request_delay_seconds: float = 0.0,
     respect_robots_txt: bool = True,
+    max_response_bytes: int = 26_214_400,
 ) -> BrowserFetcher:
     """### Build a browser fetcher bound to a synthetic session and clock."""
     return BrowserFetcher(
         user_agent="LexCrawl-test/0.1",
         session=session,
+        binary_fetcher=FakeBinaryFetcher(session),
         max_retries=max_retries,
         backoff_seconds=backoff_seconds,
         request_delay_seconds=request_delay_seconds,
         respect_robots_txt=respect_robots_txt,
+        max_response_bytes=max_response_bytes,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
@@ -105,6 +140,13 @@ def test_browser_fetch_returns_utf8_html(clock: ClockRecorder) -> None:
     assert page.status_code == 200
     assert page.content_type == "text/html"
     assert "الخبر" in page.content.decode("utf-8")
+
+
+def test_browser_rejects_a_rendered_document_over_the_size_limit(clock: ClockRecorder) -> None:
+    """### Rendered page bytes above the configured cap are not returned to actors."""
+    session = FakeBrowserSession({ARTICLE_URL: rendered(ARTICLE_URL, "x" * 20)})
+    with pytest.raises(ResponseTooLargeError):
+        build_fetcher(session, clock, max_response_bytes=10).fetch(ARTICLE_URL)
 
 
 def test_browser_detects_bot_protection_page(clock: ClockRecorder) -> None:
@@ -238,6 +280,15 @@ def test_browser_reports_binary_transport_failures(clock: ClockRecorder) -> None
     session.binary_errors = {ARTICLE_URL: "connection reset"}
     with pytest.raises(FetchError):
         build_fetcher(session, clock).fetch_binary(ARTICLE_URL)
+
+
+def test_browser_binary_fetch_obeys_the_pdf_size_limit(clock: ClockRecorder) -> None:
+    """### Binary responses exceeding the caller's PDF limit fail before extraction."""
+    session = FakeBrowserSession({ARTICLE_URL: rendered(ARTICLE_URL)})
+    session.binary = {ARTICLE_URL: "%PDF-" + "x" * 20}
+
+    with pytest.raises(ResponseTooLargeError):
+        build_fetcher(session, clock).fetch_binary(ARTICLE_URL, max_bytes=10)
 
 
 def test_browser_refuses_json_posts(clock: ClockRecorder) -> None:

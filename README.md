@@ -250,6 +250,41 @@ text into the article text. The canonical model's `DocumentResource` gained opti
 `display_title`, `mime_type`, `file_size`, `content_hash`, and `status` fields (all defaulted, so
 UAE and Commerce are unaffected).
 
+#### Report contract, dates, and resources
+
+Commerce has an explicit contract (`validation/commerce.py`) validated inside the crawl:
+
+- `CommerceReport`: fixed `source`, `source_url`, non-empty `title`, `published_month`,
+  `published_year`, `published_date_raw`, `published_precision`, optional `text`, `content_hash`,
+  `image_url`, `native_id`, `api_created_at`, `resources`, and provenance
+  (`provenance`, `archive_url`, `archived_at`, `archive_listing_url`).
+- `CommerceResource`: `title`, optional `original_url`, `resource_type`, `mime_type`,
+  `file_size`, `extracted_text`, `content_hash`, `extraction_status`, plus `display_title`,
+  `error`, `archive_url`, `archived_at`.
+
+**Publication dates are month-precision.** The listing shows values such as `January 2025`; the
+parser (`parse_listing_date`) extracts month and year, preserves the original string, and **never
+invents a day**. The canonical document keeps `published_at` for sources with exact dates and, for
+Commerce, sets `published_at: null` with `published_month`/`published_year`/`published_date_raw`
+and `published_precision: "month"`. An absent date is a warning, never a guess — the API's
+`created` timestamp is retained only as `api_created_at` provenance and is **not** used as a
+publication date. Attached resources inherit their period through the parent report.
+
+**Resources stay separate.** One report owns zero or more resources: a single PDF, several PDFs
+(each with its own URL, text, hash, and a `display_title` of `Title [file.pdf]`), or no PDF at all
+(in which case the report page text fills the report `text`). Attachments without a recoverable
+URL keep their filename/MIME/size metadata and are marked `url_unavailable` — a URL is never
+fabricated from a filename. Excel and other types are metadata only and never go through PDF
+extraction. A failed attachment never invalidates the report: resource findings are reported
+independently.
+
+**API vs archive representations are distinct.** `from_api_payload` builds a `live` report from
+the API (body text, lowercase `image`, attachment metadata without URLs, no verified publication
+date) while `from_listing_row` builds a `wayback` report from an archived listing row (month-year
+date, page URL, PDF URLs, capture timestamps as provenance only). Both map to the same canonical
+contract, so they can be reconciled later without merging here. API pagination uses explicit
+`page[offset]` values on the configured host; a foreign-host `links.next` is ignored.
+
 ### Courtesy and reliability
 
 Explicit connect/read timeouts, bounded retries with exponential backoff for transient

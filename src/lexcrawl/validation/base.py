@@ -10,6 +10,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from lexcrawl.models.document import TEXT_BEGIN_MARKER, compute_content_hash, ensure_text_marker
 
 IssueSeverity = Literal["error", "warning"]
+ResourceType = Literal["pdf", "excel", "word", "csv", "other"]
+RESOURCE_TYPES: tuple[str, ...] = ("pdf", "excel", "word", "csv", "other")
+_RESOURCE_TYPE_MAP: dict[str, ResourceType] = {
+    "pdf": "pdf",
+    "excel": "excel",
+    "word": "word",
+    "csv": "csv",
+    "other": "other",
+}
 
 
 class ValidationIssue(BaseModel):
@@ -48,6 +57,11 @@ class ValidationReport(BaseModel):
     def merged(self, other: ValidationReport) -> ValidationReport:
         """### Combine two reports into a new one."""
         return ValidationReport(issues=(*self.issues, *other.issues))
+
+
+def normalize_resource_type(value: str) -> ResourceType:
+    """### Normalize a detected file kind to a supported resource type."""
+    return _RESOURCE_TYPE_MAP.get(value, "other")
 
 
 def http_url_issue(value: str | None, *, field: str, required: bool = True) -> ValidationIssue | None:

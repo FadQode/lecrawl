@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,13 +23,30 @@ class FetchError(RuntimeError):
 
     def __init__(self, message: str, *, url: str, status_code: int | None = None) -> None:
         """### Record the failure with the URL and optional status code."""
-        super().__init__(message)
-        self.url = url
+        safe_url = redact_url(url)
+        super().__init__(message.replace(url, safe_url))
+        self.url = safe_url
         self.status_code = status_code
 
 
 class TransientFetchError(FetchError):
     """### Failure that is safe to retry, such as a timeout or a 5xx response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        """### Retain an optional server-directed retry delay."""
+        super().__init__(message, url=url, status_code=status_code)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ResponseTooLargeError(FetchError):
+    """### The response exceeded the configured download limit."""
 
 
 class NonTextContentError(FetchError):
@@ -60,8 +79,8 @@ class Fetcher(Protocol):
         """### Retrieve one URL or raise a `FetchError`."""
         ...
 
-    def fetch_binary(self, url: str) -> FetchedPage:
-        """### Retrieve one URL as raw bytes, including non-textual payloads."""
+    def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
+        """### Retrieve a bounded raw-byte response, such as a PDF attachment."""
         ...
 
     def post_json(self, url: str, *, payload: str) -> FetchedPage:
@@ -94,3 +113,35 @@ def detect_bot_block(status_code: int | None, content: bytes) -> str | None:
         if marker in body:
             return marker.decode("utf-8", errors="replace")
     return None
+
+
+def redact_url(url: str) -> str:
+    """### Remove credential-like query values before a URL enters logs or errors."""
+    parts = urlparse(url)
+    sensitive = {"api_key", "apikey", "api-key", "access_token", "token", "key", "password", "secret"}
+    query = [
+        (name, "[REDACTED]" if name.lower() in sensitive else value)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
+    """### Validate a request destination and optional hostname allowlist."""
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower().rstrip(".")
+    if parts.scheme not in {"http", "https"} or not host or parts.username or parts.password:
+        raise FetchError("destination must be an absolute HTTP(S) URL without credentials", url=url)
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        raise FetchError("local network destinations are not allowed", url=url)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise FetchError("non-public IP destinations are not allowed", url=url)
+    if allowed_hosts:
+        permitted = {value.lower().rstrip(".") for value in allowed_hosts}
+        if host not in permitted:
+            raise FetchError("destination host is not allowed", url=url)
+    return url
