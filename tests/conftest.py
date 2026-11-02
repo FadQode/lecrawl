@@ -21,12 +21,14 @@ class StubFetcher:
         *,
         failures: dict[str, Exception] | None = None,
         content_type: str = "text/html",
+        content_types: dict[str, str] | None = None,
         post_responses: list[bytes] | None = None,
     ) -> None:
         """### Map URLs to payload bodies, failures, and posted responses."""
         self._pages = pages
         self._failures = failures or {}
         self._content_type = content_type
+        self._content_types = content_types or {}
         self._post_responses = list(post_responses or [])
         self.calls: list[str] = []
         self.posts: list[tuple[str, str]] = []
@@ -38,7 +40,12 @@ class StubFetcher:
             raise self._failures[url]
         if url not in self._pages:
             raise FetchError("no canned payload for URL", url=url)
-        return FetchedPage(url=url, status_code=200, content=self._pages[url], content_type=self._content_type)
+        return FetchedPage(
+            url=url,
+            status_code=200,
+            content=self._pages[url],
+            content_type=self._content_types.get(url, self._content_type),
+        )
 
     def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
         """### Return a canned payload as raw bytes."""

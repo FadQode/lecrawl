@@ -68,6 +68,7 @@ def build_fetcher(
         pages,
         failures=failures,
         content_type="application/json",
+        content_types={PDF_TARGET: "application/pdf"},
         post_responses=listings,
     )
 

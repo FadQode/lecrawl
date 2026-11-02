@@ -10,6 +10,7 @@ import respx
 
 from lexcrawl.crawling.base import (
     AccessBlockedError,
+    AccessDeniedError,
     FetchError,
     NonTextContentError,
     ResponseTooLargeError,
@@ -205,6 +206,14 @@ def test_fetch_identifies_bot_protection_block(clock: ClockRecorder) -> None:
         build_fetcher(clock, max_retries=2).fetch(ARTICLE_URL)
     assert error.value.reason == "Attention Required! | Cloudflare"
     assert error.value.status_code == 403
+
+
+@respx.mock
+def test_fetch_classifies_plain_forbidden_as_access_denied(clock: ClockRecorder) -> None:
+    """### An unmarked 403 is an access denial, not a generic fetch failure."""
+    respx.get(ARTICLE_URL).mock(return_value=html_response("Forbidden", status_code=403))
+    with pytest.raises(AccessDeniedError):
+        build_fetcher(clock).fetch(ARTICLE_URL)
 
 
 @respx.mock

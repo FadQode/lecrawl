@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -9,14 +10,18 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from lexcrawl.actors.base import Actor, ActorRunResult
 from lexcrawl.config import required_setting
-from lexcrawl.crawling.base import Fetcher, FetchError, redact_url
+from lexcrawl.crawling.base import AccessBlockedError, AccessDeniedError, Fetcher, FetchError, redact_url
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import CanonicalDocument
+from lexcrawl.pipeline.pdf import is_pdf_content_type
 from lexcrawl.validation.commerce import (
     SOURCE_NAME as CONTRACT_SOURCE_NAME,
 )
 from lexcrawl.validation.commerce import (
     CommerceReport,
+    CommerceResource,
+    display_titles,
+    extract_pdf_resource,
     from_api_payload,
     is_report_url,
     to_canonical,
@@ -147,6 +152,8 @@ class CommerceReportsActor(Actor):
         max_pages: int = 4,
         page_size: int = 50,
         language: str = "en",
+        max_pdf_bytes: int = 26_214_400,
+        pdf_timeout_seconds: float = 60.0,
         source_name: str = SOURCE_NAME,
     ) -> None:
         """### Configure the API endpoint, filter, and page bounds."""
@@ -158,6 +165,8 @@ class CommerceReportsActor(Actor):
         self.max_pages = max(1, max_pages)
         self.page_size = max(1, page_size)
         self.language = language
+        self.max_pdf_bytes = max_pdf_bytes
+        self.pdf_timeout_seconds = pdf_timeout_seconds
         self.source_name = source_name
         self._logger = get_logger(f"{__name__}.{source_name}")
 
@@ -167,8 +176,12 @@ class CommerceReportsActor(Actor):
         result = ActorRunResult(source=self.source_name)
         state = _RunState()
 
-        self._walk_api(fetcher, state, result)
-        self._materialize(state, result)
+        try:
+            self._walk_api(fetcher, state, result)
+            self._materialize(fetcher, state, result)
+        except Exception as error:
+            self._logger.exception("actor_phase_failed", extra={"source": self.source_name})
+            result.add_error(f"unexpected actor phase failure: {error!r}")
 
         result.pagination_complete = state.pagination_complete
         result.duration_seconds = time.monotonic() - started_at
@@ -186,6 +199,7 @@ class CommerceReportsActor(Actor):
 
     def _walk_api(self, fetcher: Fetcher, state: _RunState, result: ActorRunResult) -> None:
         """### Walk the API by explicit offsets, never by following foreign-host links."""
+        page_fingerprints: set[str] = set()
         for page_index in range(self.max_pages):
             page_url = build_page_url(
                 self.api_url,
@@ -211,6 +225,13 @@ class CommerceReportsActor(Actor):
                 return
 
             result.listing_pages_succeeded += 1
+            fingerprint = hashlib.sha256(
+                json.dumps(page.records, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+            if fingerprint in page_fingerprints:
+                result.add_error(f"API repeated a page at offset {page_index * self.page_size}")
+                return
+            page_fingerprints.add(fingerprint)
             if page.skipped_records:
                 result.add_error(f"skipped {page.skipped_records} unusable record(s) on {redact_url(page_url)}")
             for payload in page.records:
@@ -231,52 +252,128 @@ class CommerceReportsActor(Actor):
                 return
         result.add_error(f"stopped after hitting max_pages={self.max_pages}")
 
-    def _materialize(self, state: _RunState, result: ActorRunResult) -> None:
+    def _materialize(self, fetcher: Fetcher, state: _RunState, result: ActorRunResult) -> None:
         """### Validate each report and adapt it to the canonical contract."""
         if not state.payloads:
             result.add_error("no report records matched the API filter")
             return
         for url, payload in state.payloads.items():
             result.detail_pages_attempted += 1
-            report = from_api_payload(payload)
-            validation = validate_report(report, expected_host=self.article_host)
-            for issue in validation.article.errors:
-                result.add_error(f"{url} {issue.field} {issue.code}: {issue.message}")
-            for issue in validation.article.warnings:
-                self._logger.warning("report_warning", extra={"url": url, "code": issue.code})
-            for index, report_issues in enumerate(validation.resources):
-                for issue in report_issues.errors:
-                    result.add_error(f"{url} resources.{index} {issue.code}: {issue.message}")
-                for issue in report_issues.warnings:
-                    self._logger.warning(
-                        "resource_warning",
-                        extra={"url": url, "index": index, "code": issue.code},
-                    )
-            if not validation.ok:
-                # $ A report that fails identity validation keeps only its metadata.$
+            try:
+                self._materialize_one(fetcher, url, payload, result)
+            except Exception as error:
+                self._logger.exception("report_materialization_failed", extra={"url": redact_url(url)})
+                result.detail_pages_failed += 1
                 result.records_missing_required_fields += 1
-                result.detail_pages_failed += 1
-                result.documents.append(self._metadata_document(report))
-                continue
-            document = to_canonical(report)
-            if document.text is None:
-                result.records_without_text += 1
-                result.detail_pages_failed += 1
-            else:
-                result.detail_pages_succeeded += 1
-            result.documents.append(document)
+                result.add_error(f"report materialization failed at {redact_url(url)}: {error}")
+                title = str(payload.get("label") or payload.get("title") or "Unavailable report").strip()
+                result.documents.append(
+                    CanonicalDocument(
+                        source=CONTRACT_SOURCE_NAME,
+                        source_url=url,
+                        title=title or "Unavailable report",
+                        language="en",
+                        extraction_status="failed",
+                        extraction_error=repr(error),
+                        native_id=str(payload.get("id")) if payload.get("id") is not None else None,
+                    )
+                )
+
+    def _materialize_one(self, fetcher: Fetcher, url: str, payload: dict[str, object], result: ActorRunResult) -> None:
+        """### Isolate one API record's conversion and resource failures."""
+        report = from_api_payload(payload)
+        resources: list[CommerceResource] = []
+        result.discover_resources(len(report.resources))
+        for resource in report.resources:
+            processed = self._process_resource(fetcher, resource, url)
+            result.account_resource(processed.extraction_status)
+            if processed.extraction_status in {"failed", "access_blocked", "url_unavailable"}:
+                result.add_error(
+                    f"resource {processed.extraction_status} at {redact_url(processed.original_url or url)}: "
+                    f"{processed.error or processed.title}"
+                )
+            resources.append(processed)
+        report = report.model_copy(update={"resources": display_titles(tuple(resources))})
+        validation = validate_report(report, expected_host=self.article_host)
+        for issue in validation.article.errors:
+            result.add_error(f"{url} {issue.field} {issue.code}: {issue.message}")
+        for issue in validation.article.warnings:
+            self._logger.warning("report_warning", extra={"url": url, "code": issue.code})
+        for index, report_issues in enumerate(validation.resources):
+            for issue in report_issues.errors:
+                result.add_error(f"{url} resources.{index} {issue.code}: {issue.message}")
+            for issue in report_issues.warnings:
+                self._logger.warning("resource_warning", extra={"url": url, "index": index, "code": issue.code})
+        if not validation.ok:
+            # $ A report that fails identity validation keeps only its metadata.$
+            result.records_missing_required_fields += 1
+            result.detail_pages_failed += 1
+            result.documents.append(self._metadata_document(report))
+            return
+        document = to_canonical(report)
+        if document.text is None:
+            result.records_without_text += 1
+            result.detail_pages_failed += 1
+        else:
+            result.detail_pages_succeeded += 1
+        result.documents.append(document)
+
+    def _process_resource(self, fetcher: Fetcher, resource: CommerceResource, report_url: str) -> CommerceResource:
+        """### Download and extract one linked PDF while retaining its parent report."""
+        if resource.original_url is None:
+            return resource
+        if resource.resource_type != "pdf":
+            return resource.model_copy(update={"extraction_status": "not_applicable"})
+        try:
+            page = fetcher.fetch_binary(resource.original_url, max_bytes=self.max_pdf_bytes)
+            if page.status_code is not None and not 200 <= page.status_code < 300:
+                raise FetchError(
+                    "PDF response returned an unsuccessful HTTP status",
+                    url=resource.original_url,
+                    status_code=page.status_code,
+                )
+            if not is_pdf_content_type(page.content_type):
+                raise ValueError("response content type is not PDF")
+            extracted = extract_pdf_resource(
+                resource,
+                page.content,
+                max_bytes=self.max_pdf_bytes,
+                timeout_seconds=self.pdf_timeout_seconds,
+            )
+            return extracted.model_copy(
+                update={"mime_type": resource.mime_type or page.content_type or "application/pdf"}
+            )
+        except (AccessBlockedError, AccessDeniedError) as error:
+            status = "access_blocked"
+            message = str(error)
+        except FetchError as error:
+            status = "url_unavailable" if error.status_code in {404, 410} else "failed"
+            message = str(error)
+        except ValueError as error:
+            status = "failed"
+            message = str(error)
+        self._logger.warning(
+            "pdf_resource_failed",
+            extra={"url": redact_url(resource.original_url), "parent_url": redact_url(report_url), "status": status},
+        )
+        return resource.model_copy(update={"extraction_status": status, "error": message})
 
     def _metadata_document(self, report: CommerceReport) -> CanonicalDocument:
         """### Store a report whose content failed validation without pretending it has text."""
         return CanonicalDocument(
             source=report.source,
+            native_id=report.native_id,
             source_url=report.source_url,
             title=report.title,
             language=report.language,
+            extraction_status="failed",
+            extraction_error="report text is unavailable or failed validation",
+            published_at=report.published_at,
             published_month=report.published_month,
             published_year=report.published_year,
             published_date_raw=report.published_date_raw,
             published_precision=report.published_precision,
+            source_created_at=report.api_created_at,
             image_url=report.image_url,
             provenance=report.provenance,
         )

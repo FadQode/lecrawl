@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import pymupdf
 import pytest
 
 from lexcrawl.actors.commerce import (
@@ -12,9 +15,9 @@ from lexcrawl.actors.commerce import (
     parse_api_page,
     with_api_key,
 )
-from lexcrawl.crawling.base import AccessBlockedError
-from lexcrawl.models.document import TEXT_BEGIN_MARKER
-from lexcrawl.validation.commerce import is_report_url
+from lexcrawl.crawling.base import AccessBlockedError, FetchError
+from lexcrawl.models.document import TEXT_BEGIN_MARKER, CanonicalDocument
+from lexcrawl.validation.commerce import from_api_payload, is_report_url
 
 from ..conftest import StubFetcher
 from ..samples import REPORTS_API_URL, REPORTS_ARTICLE_PATHS, REPORTS_HOST, commerce_page, commerce_record
@@ -48,13 +51,33 @@ def build_actor(
     )
 
 
-def build_fetcher(pages: dict[str, bytes], *, failures: dict[str, Exception] | None = None) -> StubFetcher:
+def build_fetcher(
+    pages: dict[str, bytes],
+    *,
+    failures: dict[str, Exception] | None = None,
+    content_types: dict[str, str] | None = None,
+) -> StubFetcher:
     """### Serve canned API payloads."""
-    return StubFetcher(pages, failures=failures or {}, content_type="application/vnd.api+json")
+    return StubFetcher(
+        pages,
+        failures=failures or {},
+        content_type="application/vnd.api+json",
+        content_types=content_types,
+    )
+
+
+def build_pdf(text: str) -> bytes:
+    """### Create a small synthetic PDF for offline attachment tests."""
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 72), text)
+    payload = document.tobytes()
+    document.close()
+    return payload
 
 
 def test_actor_maps_a_report_into_the_contract() -> None:
-    """### A report becomes a canonical document with API provenance and no invented date."""
+    """### A report maps observed API text, identity, date and provenance into canonical output."""
     record = commerce_record()
     result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
 
@@ -70,11 +93,59 @@ def test_actor_maps_a_report_into_the_contract() -> None:
     assert document.language == "en"
     assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
     assert document.content_hash
-    assert document.published_at is None
-    assert document.published_month is None and document.published_year is None
-    assert document.published_precision is None
+    assert document.native_id == str(record["id"])
+    assert document.identity_key == f"commerce_reports:id:{record['id']}"
+    assert document.published_at.isoformat() == "2026-01-15"
+    assert document.source_created_at is not None
+    assert document.source_created_at.year == 2026
+    assert document.published_month is None and document.published_year == 2026
+    assert document.published_precision == "day"
+    assert document.summary == "A short teaser."
     assert document.provenance == "live"
     assert document.archive_url is None
+
+
+def test_api_mapping_normalizes_nested_html_and_uses_teaser_precedence() -> None:
+    """### API text is readable, scripts are omitted, and created is not publication date."""
+    record = commerce_record(
+        body="<div><ul><li><p>First &amp; clear.</p></li><li><p>Second point.</p></li></ul>"
+        "<script>tracking()</script><style>.hidden{display:none}</style></div>",
+        teaser="<p>Teaser &amp; details.</p>",
+        subtitle="Subtitle fallback",
+        created=1,
+        post_date="2024-05-06",
+    )
+    report = from_api_payload(record)
+    assert report.text == "TEXT-BEGIN\nFirst & clear.\n\nSecond point."
+    assert "tracking" not in (report.text or "")
+    assert report.summary == "Teaser & details."
+    assert report.published_at.isoformat() == "2024-05-06"
+    assert report.api_created_at is not None and report.api_created_at.year == 1970
+
+
+def test_api_mapping_supports_month_year_and_keeps_unknown_date_raw() -> None:
+    """### Publication precision is retained without assigning a missing day."""
+    report = from_api_payload(commerce_record(post_date=None, post_date_formatted="January 2024"))
+    assert report.published_at is None
+    assert (report.published_month, report.published_year, report.published_precision) == (1, 2024, "month")
+    unknown = from_api_payload(commerce_record(post_date="the other day", post_date_formatted=None))
+    assert unknown.published_date_raw == "the other day"
+    assert unknown.published_precision is None
+
+
+def test_api_mapping_uses_subtitle_when_teaser_is_empty() -> None:
+    """### Subtitle supplies the canonical summary when teaser is absent."""
+    report = from_api_payload(commerce_record(teaser="  ", subtitle="<p>Secondary summary.</p>"))
+    assert report.summary == "Secondary summary."
+    assert from_api_payload(commerce_record(teaser=None, subtitle=None)).summary is None
+
+
+def test_api_mapping_resolves_explicit_relative_attachment_urls() -> None:
+    """### A real relative download URL is resolved without constructing a URL from a title."""
+    record = commerce_record(documents=[{"id": "file-9", "title": "attachment.pdf", "url": "/files/attachment.pdf"}])
+    report = from_api_payload(record)
+    assert report.resources[0].native_id == "file-9"
+    assert report.resources[0].original_url == f"https://{REPORTS_HOST}/files/attachment.pdf"
 
 
 def test_actor_preserves_attachment_metadata_without_fabricating_urls() -> None:
@@ -91,16 +162,58 @@ def test_actor_preserves_attachment_metadata_without_fabricating_urls() -> None:
             }
         ],
     )
-    document = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])})).documents[0]
+    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
+    document = result.documents[0]
 
     assert len(document.resources) == 1
     resource = document.resources[0]
+    assert resource.native_id == "1854"
+    assert resource.parent_identity == document.identity_key
     assert resource.url is None
     assert resource.kind == "pdf"
     assert resource.mime_type == "application/pdf"
     assert resource.file_size == 1_646_999
     assert resource.status == "url_unavailable"
     assert resource.text is None
+    assert result.status == "partial_failure"
+    assert (result.resources_discovered, result.resources_processed, result.resources_unavailable) == (1, 1, 1)
+
+
+def test_actor_extracts_declared_pdf_urls_independently_of_report_text() -> None:
+    """### Linked PDFs are extracted onto their own resources and non-PDF files are skipped."""
+    first_url = f"https://{REPORTS_HOST}/files/first.pdf"
+    missing_url = f"https://{REPORTS_HOST}/files/missing.pdf"
+    sheet_url = f"https://{REPORTS_HOST}/files/table.xlsx"
+    record = commerce_record(
+        documents=[
+            {"title": "first.pdf", "filemime": "application/pdf", "url": first_url},
+            {"title": "missing.pdf", "filemime": "application/pdf", "url": missing_url},
+            {
+                "title": "table.xlsx",
+                "filemime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "url": sheet_url,
+            },
+        ]
+    )
+    fetcher = build_fetcher(
+        {FIRST_PAGE_URL: commerce_page([record]), first_url: build_pdf("Attachment text")},
+        failures={missing_url: FetchError("not found", url=missing_url, status_code=404)},
+        content_types={first_url: "application/pdf"},
+    )
+
+    result = build_actor().run(fetcher)
+    document = result.documents[0]
+
+    assert document.text is not None and "First report paragraph" in document.text
+    first, missing, sheet = document.resources
+    assert first.status == "complete" and first.text and "Attachment text" in first.text
+    assert first.text != document.text and first.page_count == 1
+    assert missing.status == "url_unavailable" and missing.text is None
+    assert sheet.status == "not_applicable" and sheet.url == sheet_url
+    assert sheet_url not in fetcher.calls
+    assert result.status == "partial_failure"
+    assert (result.resources_discovered, result.resources_processed) == (3, 3)
+    assert (result.resources_extracted, result.resources_unavailable, result.resources_skipped) == (1, 1, 1)
 
 
 def test_actor_maps_the_lowercase_image_field() -> None:
@@ -144,6 +257,52 @@ def test_actor_paginates_by_explicit_offsets() -> None:
     assert all(url.startswith(REPORTS_API_URL) for url in fetcher.calls)
 
 
+def test_actor_stops_when_offset_pagination_repeats_a_page() -> None:
+    """### Repeated API responses cannot keep pagination moving over duplicate data."""
+    record = commerce_record()
+    repeated = commerce_page([record])
+    fetcher = build_fetcher({page_url(1, 0): repeated, page_url(1, 1): repeated})
+    result = build_actor(page_size=1, max_pages=3).run(fetcher)
+    assert result.articles_discovered == 1
+    assert any("repeated a page" in message for message in result.errors)
+    assert result.pagination_complete is False
+
+
+def test_malformed_record_does_not_discard_earlier_documents() -> None:
+    """### A timestamp conversion error is isolated to its own API record."""
+    valid = commerce_record()
+    malformed = commerce_record(record_id="2", href=report_url("broken"), created=10**100)
+    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([valid, malformed])}))
+    assert len(result.documents) == 2
+    assert result.documents[0].text is not None
+    assert result.documents[1].text is None
+    assert result.detail_pages_succeeded == 1
+    assert result.detail_pages_failed == 1
+    assert result.status == "partial_failure"
+
+
+def test_actor_phase_exception_keeps_already_accumulated_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """### A late actor-level failure returns the current result instead of replacing it."""
+    actor = build_actor()
+
+    def append_then_fail(fetcher: Any, state: Any, result: Any) -> None:
+        result.documents.append(
+            CanonicalDocument(
+                source="commerce_reports",
+                source_url=report_url("kept"),
+                title="Already collected",
+                language="en",
+            )
+        )
+        raise RuntimeError("unexpected conversion error")
+
+    monkeypatch.setattr(actor, "_materialize", append_then_fail)
+    result = actor.run(build_fetcher({FIRST_PAGE_URL: commerce_page([commerce_record()])}))
+    assert len(result.documents) == 1
+    assert result.documents[0].title == "Already collected"
+    assert any("unexpected actor phase failure" in error for error in result.errors)
+
+
 def test_actor_ignores_a_foreign_pagination_link() -> None:
     """### A next link on another host is never followed."""
     first = commerce_page([commerce_record()], next_page="https://www.commerce.gov/api/news?page[offset]=50")
@@ -173,7 +332,8 @@ def test_actor_deduplicates_reports_by_url() -> None:
     result = build_actor(page_size=1, max_pages=2).run(fetcher)
 
     assert len(result.documents) == 1
-    assert result.article_urls_deduplicated == 1
+    assert result.article_urls_deduplicated == 0
+    assert any("repeated a page" in message for message in result.errors)
 
 
 def test_actor_keeps_reports_without_body_as_metadata() -> None:

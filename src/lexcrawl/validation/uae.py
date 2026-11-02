@@ -38,6 +38,7 @@ class UAEArticleLocalization(BaseModel):
     published_at: date | None = None
     summary: str | None = None
     image_url: str | None = None
+    error: str | None = None
     text: str | None = None
     content_hash: str | None = None
     extraction_status: ExtractionStatus = "pending"
@@ -89,6 +90,25 @@ class UAEArticleLocalization(BaseModel):
             title=self.title,
             text=self.text,
             content_hash=self.content_hash,
+            published_at=self.published_at,
+            summary=self.summary,
+            image_url=self.image_url,
+            status="complete",
+        )
+
+    def to_canonical_state(self, *, parent_identity: str) -> DocumentTranslation:
+        """### Preserve this localization's state in the canonical document."""
+        completed = self.extraction_status == "complete"
+        return DocumentTranslation(
+            language=self.language,
+            source_url=self.article_url,
+            title=self.title,
+            text=self.text if completed else None,
+            content_hash=self.content_hash if completed else None,
+            status=self.extraction_status,
+            error=None if completed else self.error or f"localization extraction {self.extraction_status}",
+            listing_url=self.listing_url,
+            parent_identity=parent_identity,
             published_at=self.published_at,
             summary=self.summary,
             image_url=self.image_url,
@@ -286,7 +306,7 @@ def validate_listing_entry(
     return ValidationReport(issues=tuple(issues))
 
 
-def to_canonical(article: UAEArticle) -> CanonicalDocument | None:
+def to_canonical(article: UAEArticle, *, include_unconfigured_english: bool = False) -> CanonicalDocument | None:
     """### Adapt one validated article to the canonical contract, or None without content."""
     completed = article.completed_localizations
     if not completed:
@@ -295,18 +315,27 @@ def to_canonical(article: UAEArticle) -> CanonicalDocument | None:
     chosen = article.primary if article.primary.extraction_status == "complete" else completed[0]
     if chosen.extraction_status != "complete" or chosen.text is None or chosen.content_hash is None:
         return None
-    others = tuple(item.to_translation() for item in completed if item.language != chosen.language)
+    identity = f"{article.source}:id:{article.article_key}"
+    localizations = [article.primary, *article.translations.values()]
+    others = [
+        item.to_canonical_state(parent_identity=identity) for item in localizations if item.language != chosen.language
+    ]
+    if include_unconfigured_english and not any(item.language == "en" for item in localizations):
+        others.append(DocumentTranslation(language="en", status="not_configured", parent_identity=identity))
     return CanonicalDocument(
         source=article.source,
+        native_id=article.article_key,
         source_url=chosen.article_url,
+        listing_url=chosen.listing_url,
         title=chosen.title,
         language=chosen.language,
+        extraction_status="complete",
         text=chosen.text,
         content_hash=chosen.content_hash,
         published_at=chosen.published_at,
         summary=chosen.summary,
         image_url=chosen.image_url,
-        translations=others,
+        translations=tuple(others),
     )
 
 
@@ -321,14 +350,24 @@ def metadata_document(
         if preferred_language == PRIMARY_LANGUAGE
         else article.translations.get(preferred_language, article.primary)
     )
+    identity = f"{article.source}:id:{article.article_key}"
+    localizations = [article.primary, *article.translations.values()]
+    translation_states = [item.to_canonical_state(parent_identity=identity) for item in localizations]
+    if len(localizations) == 1:
+        translation_states.append(DocumentTranslation(language="en", status="not_configured", parent_identity=identity))
     return CanonicalDocument(
         source=article.source,
+        native_id=article.article_key,
         source_url=localization.article_url,
+        listing_url=localization.listing_url,
         title=localization.title,
         language=localization.language,
+        extraction_status=localization.extraction_status,
+        extraction_error=localization.error,
         published_at=localization.published_at,
         summary=localization.summary,
         image_url=localization.image_url,
+        translations=tuple(translation_states),
     )
 
 

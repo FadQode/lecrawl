@@ -13,6 +13,7 @@ from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 from lexcrawl.crawling.base import (
     RETRYABLE_STATUS_CODES,
     AccessBlockedError,
+    AccessDeniedError,
     FetchedPage,
     FetchError,
     NonTextContentError,
@@ -98,7 +99,13 @@ class HttpFetcher:
             },
         )
         self._owns_client = client is None
-        self._robots = RobotsPolicy(self._read_robots_file, user_agent=user_agent)
+        self._robots = RobotsPolicy(
+            self._read_robots_file,
+            user_agent=user_agent,
+            max_retries=max_retries,
+            backoff_seconds=backoff_seconds,
+            sleep=sleep,
+        )
 
     def close(self) -> None:
         """### Release the underlying HTTP connection pool."""
@@ -305,6 +312,10 @@ class HttpFetcher:
                 status_code=response.status_code,
                 retry_after_seconds=parse_retry_after(response.headers.get("retry-after")),
             )
+        if response.status_code in {401, 403}:
+            raise AccessDeniedError(
+                f"access denied with status {response.status_code}", url=url, status_code=response.status_code
+            )
         if response.status_code >= 400:
             raise FetchError(f"unexpected status {response.status_code}", url=url, status_code=response.status_code)
 
@@ -330,7 +341,8 @@ class HttpFetcher:
         except FetchError as error:
             return RobotsFile(
                 status_code=error.status_code,
-                error=str(error) if error.status_code is None else None,
+                error=str(error),
+                retry_after_seconds=getattr(error, "retry_after_seconds", None),
             )
         text = page.content.decode("utf-8-sig", errors="replace") if page.status_code == 200 else None
         return RobotsFile(status_code=page.status_code, text=text)

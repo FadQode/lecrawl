@@ -47,5 +47,7 @@ def paragraphs_from_html(fragment: str | bytes | None) -> list[str]:
     if not fragment:
         return []
     soup = BeautifulSoup(fragment, "lxml")
+    for ignored in soup.find_all(("script", "style", "noscript", "template")):
+        ignored.decompose()
     body = soup.body or soup
     return paragraphs_of(body)

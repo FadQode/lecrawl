@@ -8,6 +8,7 @@ import pytest
 
 from lexcrawl.crawling.base import (
     AccessBlockedError,
+    AccessDeniedError,
     FetchedPage,
     FetchError,
     ResponseTooLargeError,
@@ -116,6 +117,7 @@ def build_fetcher(
     request_delay_seconds: float = 0.0,
     respect_robots_txt: bool = True,
     max_response_bytes: int = 26_214_400,
+    allowed_redirect_hosts: tuple[str, ...] = (),
 ) -> BrowserFetcher:
     """### Build a browser fetcher bound to a synthetic session and clock."""
     return BrowserFetcher(
@@ -127,6 +129,7 @@ def build_fetcher(
         request_delay_seconds=request_delay_seconds,
         respect_robots_txt=respect_robots_txt,
         max_response_bytes=max_response_bytes,
+        allowed_redirect_hosts=allowed_redirect_hosts,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
@@ -156,6 +159,39 @@ def test_browser_detects_bot_protection_page(clock: ClockRecorder) -> None:
         build_fetcher(session, clock, max_retries=2).fetch(ARTICLE_URL)
     assert error.value.reason == "Attention Required! | Cloudflare"
     assert error.value.status_code == 403
+
+
+def test_browser_classifies_plain_forbidden_as_access_denied(clock: ClockRecorder) -> None:
+    """### An ordinary 403 remains distinct from bot-protection evidence."""
+    session = FakeBrowserSession({ARTICLE_URL: rendered(ARTICLE_URL, "<html>forbidden</html>", 403)})
+    with pytest.raises(AccessDeniedError):
+        build_fetcher(session, clock).fetch(ARTICLE_URL)
+
+
+def test_browser_rejects_cross_host_final_navigation(clock: ClockRecorder) -> None:
+    """### A redirect cannot move a rendered request outside its requested host."""
+    session = FakeBrowserSession({ARTICLE_URL: rendered("https://elsewhere.example.test/landing")})
+    with pytest.raises(FetchError, match="left the requested host"):
+        build_fetcher(session, clock).fetch(ARTICLE_URL)
+
+
+def test_browser_allows_configured_cross_host_redirect(clock: ClockRecorder) -> None:
+    """### A redirect to an explicitly configured public source alias is accepted."""
+    alias = "https://archive.example.test/ar/news/example-article"
+    session = FakeBrowserSession({ARTICLE_URL: rendered(alias)})
+    page = build_fetcher(session, clock, allowed_redirect_hosts=("listing.example.test", "archive.example.test")).fetch(
+        ARTICLE_URL
+    )
+    assert page.url == alias
+
+
+def test_browser_rejects_private_destinations_by_default(clock: ClockRecorder) -> None:
+    """### Browser requests to private IP literals are refused before navigation."""
+    session = FakeBrowserSession({})
+    fetcher = build_fetcher(session, clock)
+    with pytest.raises(FetchError, match="non-public IP"):
+        fetcher.fetch("http://127.0.0.1/private")
+    assert session.rendered == []
 
 
 def test_browser_retries_transient_failures(clock: ClockRecorder) -> None:

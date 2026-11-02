@@ -6,19 +6,22 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 
 from lexcrawl.crawling.base import (
     RETRYABLE_STATUS_CODES,
     AccessBlockedError,
+    AccessDeniedError,
     FetchedPage,
     Fetcher,
     FetchError,
     ResponseTooLargeError,
     TransientFetchError,
     detect_bot_block,
+    validate_http_url,
 )
 from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.crawling.pacing import RequestPacer
@@ -70,6 +73,8 @@ class PlaywrightBrowserSession:
         wait_until: WaitUntil = "domcontentloaded",
         settle_milliseconds: int = 250,
         user_agent: str | None = None,
+        allowed_redirect_hosts: tuple[str, ...] = (),
+        max_response_bytes: int = 26_214_400,
     ) -> None:
         """### Configure the browser launch and navigation behaviour."""
         self._headless = headless
@@ -77,6 +82,8 @@ class PlaywrightBrowserSession:
         self._wait_until = wait_until
         self._settle_seconds = max(0, settle_milliseconds) / 1000
         self._user_agent = user_agent
+        self._allowed_redirect_hosts = tuple(allowed_redirect_hosts)
+        self._max_response_bytes = max_response_bytes
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -86,15 +93,64 @@ class PlaywrightBrowserSession:
     def render(self, url: str) -> RenderedPage:
         """### Navigate to a URL and return the rendered document."""
         page = self._ensure_page()
+        blocked: list[str] = []
+
+        def guard_navigation(route: Any) -> None:
+            request = route.request
+            if request.resource_type in {"image", "media", "font"}:
+                route.abort()
+                return
+            if request.is_navigation_request() or request.resource_type == "document":
+                allowed = self._allowed_redirect_hosts or (urlparse(url).hostname or "",)
+                try:
+                    validate_http_url(
+                        request.url,
+                        allowed_hosts=allowed,
+                        allow_private_hosts=self._allowed_redirect_hosts,
+                    )
+                except FetchError:
+                    blocked.append(request.url)
+                    route.abort()
+                    return
+            route.continue_()
+
+        page.route("**/*", guard_navigation)
+        page.add_init_script(
+            f"""(() => {{
+                    const check = () => {{
+                    if (document.documentElement &&
+                        document.documentElement.outerHTML.length > {self._max_response_bytes}) window.stop();
+                }};
+                new MutationObserver(check).observe(document, {{subtree: true, childList: true, attributes: true}});
+            }})()"""
+        )
         try:
             response = page.goto(url, timeout=self._timeout_milliseconds, wait_until=self._wait_until)
+            if blocked:
+                raise FetchError("browser navigation destination was rejected", url=blocked[-1])
         except Exception as error:  # $ Driver failures are transient from the strategy's point of view.$
+            if blocked:
+                raise FetchError("browser navigation destination was rejected", url=blocked[-1]) from error
+            if isinstance(error, FetchError):
+                raise
             raise TransientFetchError(f"browser navigation failed: {error}", url=url) from error
+        finally:
+            page.unroute("**/*", guard_navigation)
         if self._settle_seconds:
             page.wait_for_timeout(int(self._settle_seconds * 1000))
         status_code = response.status if response is not None else None
         retry_after = response.headers.get("retry-after") if response is not None else None
-        return RenderedPage(url=page.url, status_code=status_code, html=page.content(), retry_after=retry_after)
+        final_url = page.url
+        allowed = self._allowed_redirect_hosts or (urlparse(url).hostname or "",)
+        try:
+            validate_http_url(
+                final_url,
+                allowed_hosts=allowed,
+                allow_private_hosts=self._allowed_redirect_hosts,
+            )
+        except FetchError as error:
+            raise FetchError("browser navigation ended outside the requested host boundary", url=final_url) from error
+        return RenderedPage(url=final_url, status_code=status_code, html=page.content(), retry_after=retry_after)
 
     def read_text(self, url: str) -> RobotsFile:
         """### Retrieve a plain-text resource without rendering it."""
@@ -103,7 +159,22 @@ class PlaywrightBrowserSession:
             response = context.request.get(url, timeout=self._timeout_milliseconds)
         except Exception as error:  # $ The driver reports unreachable resources as exceptions.$
             return RobotsFile(error=str(error))
-        return RobotsFile(status_code=response.status, text=response.text() if response.status == 200 else None)
+        allowed = self._allowed_redirect_hosts or (urlparse(url).hostname or "",)
+        try:
+            validate_http_url(
+                response.url,
+                allowed_hosts=allowed,
+                allow_private_hosts=self._allowed_redirect_hosts,
+            )
+        except FetchError as error:
+            return RobotsFile(status_code=response.status, error=str(error))
+        content = response.body() if response.status == 200 else None
+        if content is not None and len(content) > min(self._max_response_bytes, 512_000):
+            return RobotsFile(status_code=response.status, error="robots.txt exceeded the byte limit")
+        return RobotsFile(
+            status_code=response.status,
+            text=content.decode("utf-8-sig", errors="replace") if content is not None else None,
+        )
 
     def close(self) -> None:
         """### Close the browser, its context, and the driver."""
@@ -167,6 +238,7 @@ class BrowserFetcher:
         self._backoff_seconds = backoff_seconds
         self._sleep = sleep
         self._respect_robots_txt = respect_robots_txt
+        self._allowed_redirect_hosts = tuple(allowed_redirect_hosts)
         self._max_response_bytes = max(1, max_response_bytes)
         self._pacer = RequestPacer(request_delay_seconds, sleep=sleep, monotonic=monotonic)
         self._cache: dict[str, FetchedPage] = {}
@@ -179,6 +251,8 @@ class BrowserFetcher:
             wait_until=wait_until,
             settle_milliseconds=settle_milliseconds,
             user_agent=user_agent or None,
+            allowed_redirect_hosts=allowed_redirect_hosts,
+            max_response_bytes=max_response_bytes,
         )
         self._owns_binary_fetcher = binary_fetcher is None
         self._binary_fetcher = binary_fetcher or HttpFetcher(
@@ -191,7 +265,13 @@ class BrowserFetcher:
             allowed_redirect_hosts=allowed_redirect_hosts,
             max_response_bytes=self._max_response_bytes,
         )
-        self._robots = RobotsPolicy(self._session.read_text, user_agent=user_agent)
+        self._robots = RobotsPolicy(
+            self._session.read_text,
+            user_agent=user_agent,
+            max_retries=max_retries,
+            backoff_seconds=backoff_seconds,
+            sleep=sleep,
+        )
 
     def close(self) -> None:
         """### Close the browser session when this fetcher owns it."""
@@ -225,6 +305,11 @@ class BrowserFetcher:
         if cached is not None:
             self._logger.debug("fetch_cache_hit", extra={"url": url})
             return cached
+        validate_http_url(
+            url,
+            allowed_hosts=self._allowed_redirect_hosts,
+            allow_private_hosts=self._allowed_redirect_hosts,
+        )
         if self._respect_robots_txt:
             self._robots.assert_allowed(url)
         page = self._fetch_once_with_retries(url)
@@ -290,11 +375,20 @@ class BrowserFetcher:
                 status_code=rendered.status_code,
                 retry_after_seconds=parse_retry_after(rendered.retry_after),
             )
+        if rendered.status_code in {401, 403}:
+            raise AccessDeniedError(
+                f"access denied with status {rendered.status_code}", url=url, status_code=rendered.status_code
+            )
         if rendered.status_code is not None and rendered.status_code >= 400:
             raise FetchError(f"unexpected status {rendered.status_code}", url=url, status_code=rendered.status_code)
         if not rendered.html.strip():
             raise FetchError("browser returned an empty document", url=url, status_code=rendered.status_code)
 
+        try:
+            allowed = self._allowed_redirect_hosts or (urlparse(url).hostname or "",)
+            validate_http_url(rendered.url, allowed_hosts=allowed, allow_private_hosts=self._allowed_redirect_hosts)
+        except FetchError as error:
+            raise FetchError(f"browser navigation left the requested host: {error}", url=url) from error
         return FetchedPage(
             url=rendered.url,
             status_code=rendered.status_code,

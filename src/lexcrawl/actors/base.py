@@ -16,8 +16,8 @@ RunStatus = Literal["success", "partial_failure", "failed"]
 class ActorRunResult:
     """### Outcome and measured counters for one actor invocation.
 
-    Detail counters describe article-level extraction outcomes: an entry stored with its
-    listing metadata but without extracted text counts as a failed extraction.
+    Detail counters describe source-specific article units (UAE localizations, CBA releases,
+    Commerce reports). Resource counters count linked attachments, never parent documents.
     """
 
     source: str
@@ -34,6 +34,12 @@ class ActorRunResult:
     detail_pages_failed: int = 0
     records_missing_required_fields: int = 0
     records_without_text: int = 0
+    resources_discovered: int = 0
+    resources_processed: int = 0
+    resources_extracted: int = 0
+    resources_unavailable: int = 0
+    resources_failed: int = 0
+    resources_skipped: int = 0
     pagination_complete: bool = False
     duration_seconds: float = 0.0
 
@@ -49,6 +55,22 @@ class ActorRunResult:
     def add_error(self, message: str) -> None:
         """### Record one actionable error message for the run report."""
         self.errors.append(message)
+
+    def discover_resources(self, count: int) -> None:
+        """### Count links discovered before any resource processing starts."""
+        self.resources_discovered += max(0, count)
+
+    def account_resource(self, status: str) -> None:
+        """### Count one processed resource by its final extraction status."""
+        self.resources_processed += 1
+        if status == "complete":
+            self.resources_extracted += 1
+        elif status == "url_unavailable":
+            self.resources_unavailable += 1
+        elif status in {"failed", "access_blocked"}:
+            self.resources_failed += 1
+        else:
+            self.resources_skipped += 1
 
 
 class Actor(ABC):

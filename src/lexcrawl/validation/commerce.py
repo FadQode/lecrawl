@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Literal, cast
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,7 +17,8 @@ from lexcrawl.models.document import (
     compute_content_hash,
     ensure_text_marker,
 )
-from lexcrawl.pipeline.pdf import PdfExtractionError, extract_pdf_text
+from lexcrawl.pipeline.normalize import paragraphs_from_html
+from lexcrawl.pipeline.pdf import extract_pdf
 from lexcrawl.validation.base import (
     RESOURCE_TYPES,
     ResourceType,
@@ -108,10 +109,13 @@ class CommerceResource(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     title: str
+    native_id: str | None = None
     original_url: str | None = None
     resource_type: ResourceType = "other"
     mime_type: str | None = None
     file_size: int | None = None
+    page_count: int | None = Field(default=None, ge=0)
+    character_count: int | None = Field(default=None, ge=0)
     extracted_text: str | None = None
     content_hash: str | None = None
     extraction_status: ResourceStatus = "pending"
@@ -149,6 +153,8 @@ class CommerceResource(BaseModel):
                 raise ValueError("complete resource extraction requires a content hash")
             if self.content_hash != compute_content_hash(text):
                 raise ValueError("resource content hash does not match the extracted text")
+            if self.character_count is not None and self.character_count != len(text):
+                raise ValueError("resource character count does not match the extracted text")
         elif self.extracted_text is not None:
             raise ValueError(f"status {self.extraction_status!r} must not carry extracted text")
         return self
@@ -163,11 +169,13 @@ class CommerceReport(BaseModel):
     source_url: str
     title: str
     language: str = OUTPUT_LANGUAGE
+    published_at: date | None = None
     published_month: int | None = Field(default=None, ge=1, le=12)
     published_year: int | None = Field(default=None, ge=MIN_YEAR, le=MAX_YEAR)
     published_date_raw: str | None = None
     published_precision: PublicationPrecision | None = None
     text: str | None = None
+    summary: str | None = None
     content_hash: str | None = None
     image_url: str | None = None
     native_id: str | None = None
@@ -209,6 +217,14 @@ class CommerceReport(BaseModel):
             self.published_month is None or self.published_year is None
         ):
             raise ValueError("month precision requires both a month and a year")
+        if self.published_precision == "month" and self.published_at is not None:
+            raise ValueError("month precision must not carry an invented publication day")
+        if self.published_precision == "day" and self.published_at is None:
+            raise ValueError("day precision requires a publication date")
+        if self.published_precision == "year" and self.published_year is None:
+            raise ValueError("year precision requires a publication year")
+        if self.published_at is not None and self.published_year not in {None, self.published_at.year}:
+            raise ValueError("publication year does not match published_at")
         if self.text is None:
             if self.content_hash is not None:
                 raise ValueError("a report without text must not carry a content hash")
@@ -295,20 +311,20 @@ def extract_pdf_resource(
     """### Extract a PDF payload into its resource, preserving the metadata."""
     if resource.resource_type != "pdf":
         raise ValueError("only PDF resources can be extracted")
-    try:
-        text = extract_pdf_text(payload, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
-    except PdfExtractionError as error:
+    result = extract_pdf(payload, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
+    if result.extracted_text is None:
         # $ A failed extraction keeps the attachment metadata and never stores partial text.$
-        return resource.model_copy(update={"extraction_status": "failed", "error": str(error)})
-    marked = ensure_text_marker(text)
+        return resource.model_copy(update={"extraction_status": "failed", "error": result.error_message})
     return CommerceResource(
         title=resource.title,
         original_url=resource.original_url,
         resource_type="pdf",
-        mime_type="application/pdf",
-        file_size=len(payload),
-        extracted_text=marked,
-        content_hash=compute_content_hash(marked),
+        mime_type=resource.mime_type or "application/pdf",
+        file_size=resource.file_size if resource.file_size is not None else len(payload),
+        extracted_text=result.extracted_text,
+        content_hash=result.content_hash,
+        page_count=result.page_count,
+        character_count=result.character_count,
         extraction_status="complete",
         display_title=resource.display_title,
         archive_url=resource.archive_url,
@@ -418,9 +434,22 @@ def validate_report(report: CommerceReport, *, expected_host: str) -> CommerceVa
         if problem is not None:
             issues.append(problem)
 
-    if report.published_date_raw is not None:
+    if report.published_date_raw is not None and report.published_precision == "day":
+        parsed_day = parse_api_publication_date(report.published_date_raw)[0]
+        if parsed_day is None or parsed_day != report.published_at:
+            issues.append(
+                ValidationIssue(
+                    field="published_date_raw",
+                    code="date_mismatch",
+                    message="stored publication day does not match the preserved API date",
+                )
+            )
+    elif report.published_date_raw is not None:
         parsed = parse_listing_date(report.published_date_raw)
-        issues.extend(parsed.issues)
+        if report.provenance == "live" and not parsed.ok:
+            issues.extend(issue.model_copy(update={"severity": "warning"}) for issue in parsed.issues)
+        else:
+            issues.extend(parsed.issues)
         if parsed.ok and (parsed.month, parsed.year) != (report.published_month, report.published_year):
             issues.append(
                 ValidationIssue(
@@ -489,20 +518,26 @@ def to_canonical(report: CommerceReport) -> CanonicalDocument:
     """### Adapt a validated report to the canonical contract without inventing a day."""
     return CanonicalDocument(
         source=report.source,
+        native_id=report.native_id,
         source_url=report.source_url,
         title=report.title,
         language=report.language,
+        extraction_status="complete" if report.text is not None else "failed",
         text=report.text,
         content_hash=report.content_hash,
-        published_at=None,
+        published_at=report.published_at,
         published_month=report.published_month,
         published_year=report.published_year,
         published_date_raw=report.published_date_raw,
         published_precision=report.published_precision,
+        source_created_at=report.api_created_at,
         image_url=report.image_url,
+        summary=report.summary,
         resources=tuple(
             DocumentResource(
                 title=resource.display_title or resource.title,
+                native_id=resource.native_id,
+                parent_identity=f"{report.source}:id:{report.native_id}" if report.native_id else None,
                 url=resource.original_url,
                 kind=resource.resource_type,
                 text=resource.extracted_text,
@@ -510,6 +545,8 @@ def to_canonical(report: CommerceReport) -> CanonicalDocument:
                 display_title=resource.display_title,
                 mime_type=resource.mime_type,
                 file_size=resource.file_size,
+                page_count=resource.page_count,
+                character_count=resource.character_count,
                 content_hash=resource.content_hash,
                 status=resource.extraction_status,
                 archive_url=resource.archive_url,
@@ -607,7 +644,22 @@ def from_api_payload(
 ) -> CommerceReport:
     """### Build a report from one API record, preserving what the API actually states."""
     body = payload.get("body")
-    text = ensure_text_marker(body) if isinstance(body, str) and body.strip() else None
+    body_paragraphs = paragraphs_from_html(body) if isinstance(body, str) else []
+    text = ensure_text_marker("\n\n".join(body_paragraphs)) if body_paragraphs else None
+    teaser = payload.get("teaser")
+    subtitle = payload.get("subtitle")
+    summary_value = teaser if isinstance(teaser, str) and teaser.strip() else subtitle
+    summary_parts = paragraphs_from_html(summary_value) if isinstance(summary_value, str) else []
+    summary = "\n\n".join(summary_parts) or None
+    raw_date = payload.get("post_date")
+    publication = parse_api_publication_date(raw_date)
+    formatted_date = payload.get("post_date_formatted")
+    if publication[4] is None and isinstance(formatted_date, str) and formatted_date.strip():
+        formatted_publication = parse_api_publication_date(formatted_date)
+        if formatted_publication[4] is not None:
+            publication = formatted_publication
+    if publication[3] is None and isinstance(formatted_date, str) and formatted_date.strip():
+        publication = (*publication[:3], formatted_date.strip(), publication[4])
     created = payload.get("created")
     created_at = None
     if (isinstance(created, (int, float)) and not isinstance(created, bool)) or (
@@ -624,16 +676,25 @@ def from_api_payload(
         mime = document.get("filemime") if isinstance(document.get("filemime"), str) else None
         size = document.get("filesize")
         file_size = int(size) if isinstance(size, str) and size.isdigit() else None
-        kind = normalize_resource_type(title.rsplit(".", 1)[-1].lower()) if "." in title else "other"
+        href = document.get("url") or document.get("uri") or document.get("download_url")
+        if not isinstance(href, str):
+            href = document.get("href")
+        original_url = href.strip() if isinstance(href, str) and href.strip() else None
+        if original_url and original_url.startswith(("/", "./", "../")):
+            base_url = str(payload.get("href") or payload.get("self") or "").strip()
+            original_url = urljoin(base_url, original_url)
+        extension_kind = normalize_resource_type(title.rsplit(".", 1)[-1].lower()) if "." in title else "other"
+        kind = "pdf" if mime and mime.lower().split(";", 1)[0].strip() == "application/pdf" else extension_kind
         resources.append(
             CommerceResource(
                 title=title,
-                original_url=None,
+                native_id=str(document["id"]) if document.get("id") is not None else None,
+                original_url=original_url,
                 resource_type=kind,
                 mime_type=mime,
                 file_size=file_size,
-                extraction_status="url_unavailable",
-                error="attachment URL is not exposed by the API",
+                extraction_status="pending" if original_url else "url_unavailable",
+                error=None if original_url else "attachment URL is not exposed by the API",
             )
         )
 
@@ -641,7 +702,13 @@ def from_api_payload(
         source=SOURCE_NAME,
         source_url=str(payload.get("href") or payload.get("self") or "").strip(),
         title=str(payload.get("label") or payload.get("title") or "").strip(),
+        published_at=publication[0],
+        published_month=publication[1],
+        published_year=publication[2],
+        published_date_raw=publication[3],
+        published_precision=publication[4],
         text=text,
+        summary=summary,
         content_hash=compute_content_hash(text) if text else None,
         image_url=image_url or api_image_url(payload),
         native_id=str(payload["id"]) if payload.get("id") is not None else None,
@@ -649,6 +716,25 @@ def from_api_payload(
         resources=tuple(resources),
         provenance="live",
     )
+
+
+def parse_api_publication_date(
+    value: object,
+) -> tuple[date | None, int | None, int | None, str | None, PublicationPrecision | None]:
+    """### Parse observed ISO day or month-year API publication dates without guessing."""
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw:
+        return None, None, None, None, None
+    try:
+        day = date.fromisoformat(raw)
+    except ValueError:
+        parsed = parse_listing_date(raw)
+        if parsed.ok and parsed.month is not None and parsed.year is not None:
+            return None, parsed.month, parsed.year, parsed.raw, "month"
+        return None, None, None, raw, None
+    if not MIN_YEAR <= day.year <= MAX_YEAR:
+        return None, None, None, raw, None
+    return day, None, day.year, raw, "day"
 
 
 __all__ = [

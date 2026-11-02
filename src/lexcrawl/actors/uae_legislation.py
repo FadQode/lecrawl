@@ -14,7 +14,7 @@ from bs4.element import Tag
 
 from lexcrawl.actors.base import Actor, ActorRunResult
 from lexcrawl.config import required_setting
-from lexcrawl.crawling.base import AccessBlockedError, Fetcher, FetchError
+from lexcrawl.crawling.base import AccessBlockedError, AccessDeniedError, Fetcher, FetchError
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import ArticleContentError, ArticleStub, CanonicalDocument, RawArticle
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
@@ -296,21 +296,24 @@ class UaeLegislationActor(Actor):
         result = ActorRunResult(source=self.source_name)
         discovered: dict[str, dict[str, ArticleStub]] = {}
 
-        complete = self._walk_listing(
-            fetcher, discovered, result, listing_url=self.listing_url, language=PRIMARY_LANGUAGE
-        )
-        if complete and self.bilingual and self.secondary_listing_url:
-            secondary = self._walk_listing(
-                fetcher,
-                discovered,
-                result,
-                listing_url=self.secondary_listing_url,
-                language=SECONDARY_LANGUAGE,
+        try:
+            complete = self._walk_listing(
+                fetcher, discovered, result, listing_url=self.listing_url, language=PRIMARY_LANGUAGE
             )
-            complete = complete and secondary
-        result.pagination_complete = complete
-
-        self._collect_details(fetcher, discovered, result)
+            if complete and self.bilingual and self.secondary_listing_url:
+                secondary = self._walk_listing(
+                    fetcher,
+                    discovered,
+                    result,
+                    listing_url=self.secondary_listing_url,
+                    language=SECONDARY_LANGUAGE,
+                )
+                complete = complete and secondary
+            result.pagination_complete = complete
+            self._collect_details(fetcher, discovered, result)
+        except Exception as error:
+            self._logger.exception("actor_phase_failed", extra={"source": self.source_name})
+            result.add_error(f"unexpected actor phase failure: {error!r}")
 
         result.duration_seconds = time.monotonic() - started_at
         self._logger.info(
@@ -418,7 +421,7 @@ class UaeLegislationActor(Actor):
                 result.add_error(issue)
             if outcome.article is None:
                 continue
-            document = to_canonical(outcome.article)
+            document = to_canonical(outcome.article, include_unconfigured_english=not self.bilingual)
             if document is None:
                 result.records_without_text += 1
                 document = metadata_document(outcome.article)
@@ -431,9 +434,42 @@ class UaeLegislationActor(Actor):
     ) -> list[_ArticleOutcome]:
         """### Extract items in order, staying single-threaded when unpooled."""
         if self.concurrency == 1:
-            return [self._extract_article(fetcher, key, stubs) for key, stubs in items]
+            return [self._safe_extract_article(fetcher, key, stubs) for key, stubs in items]
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            return list(pool.map(partial(self._extract_article, fetcher), *(zip(*items, strict=True))))
+            return list(pool.map(partial(self._safe_extract_article, fetcher), *(zip(*items, strict=True))))
+
+    def _safe_extract_article(self, fetcher: Fetcher, key: str, stubs: dict[str, ArticleStub]) -> _ArticleOutcome:
+        """### Retain a failed localization outcome when one record raises unexpectedly."""
+        try:
+            return self._extract_article(fetcher, key, stubs)
+        except Exception as error:
+            self._logger.exception("article_extraction_crashed", extra={"article_key": key})
+            languages: list[Language] = [PRIMARY_LANGUAGE]
+            if self.bilingual:
+                languages.append(SECONDARY_LANGUAGE)
+            failures = []
+            for language in languages:
+                stub = self._stub_for(key, stubs, language)
+                failures.append(
+                    self._uncollected(
+                        stub,
+                        language,
+                        self._listing_for(language),
+                        "failed",
+                        f"article extraction failed for {key} [{language}]: {error}",
+                    )
+                )
+            built = {failure.localization.language: failure.localization for failure in failures}
+            article = UAEArticle(
+                article_key=key,
+                primary=built[PRIMARY_LANGUAGE],
+                translations={language: value for language, value in built.items() if language != PRIMARY_LANGUAGE},
+            )
+            return _ArticleOutcome(
+                article=article,
+                localizations=tuple(failures),
+                issues=(f"{key}: article extraction crashed",),
+            )
 
     def _extract_article(
         self,
@@ -451,12 +487,24 @@ class UaeLegislationActor(Actor):
             languages.append(SECONDARY_LANGUAGE)
         for language in languages:
             stub = self._stub_for(key, stubs, language)
-            outcome = self._collect_localization(
-                fetcher,
-                stub=stub,
-                language=language,
-                listing_url=self._listing_for(language),
-            )
+            try:
+                outcome = self._collect_localization(
+                    fetcher,
+                    stub=stub,
+                    language=language,
+                    listing_url=self._listing_for(language),
+                )
+            except Exception as error:
+                self._logger.exception(
+                    "localization_extraction_crashed", extra={"article_key": key, "language": language}
+                )
+                outcome = self._uncollected(
+                    stub,
+                    language,
+                    self._listing_for(language),
+                    "failed",
+                    f"localization extraction failed for {key} [{language}]: {error!r}",
+                )
             outcomes.append(outcome)
             built[language] = outcome.localization
             if outcome.message:
@@ -466,7 +514,12 @@ class UaeLegislationActor(Actor):
                 details = "; ".join(f"{issue.code}: {issue.message}" for issue in report.errors)
                 issues.append(f"{stub.url} [{language}] localization rejected: {details}")
                 built[language] = outcome.localization.model_copy(
-                    update={"extraction_status": "failed", "text": None, "content_hash": None}
+                    update={
+                        "extraction_status": "failed",
+                        "text": None,
+                        "content_hash": None,
+                        "error": details,
+                    }
                 )
 
         if PRIMARY_LANGUAGE not in built:
@@ -505,7 +558,7 @@ class UaeLegislationActor(Actor):
         try:
             page = fetcher.fetch(stub.url)
             article = parse_detail(page.content, stub.url, source=self.source_name, language=language)
-        except AccessBlockedError as error:
+        except (AccessBlockedError, AccessDeniedError) as error:
             return self._uncollected(
                 stub, language, listing_url, "access_blocked", f"article fetch failed at {stub.url}: {error}"
             )
@@ -559,6 +612,7 @@ class UaeLegislationActor(Actor):
                 "published_at": stub.published_at,
                 "summary": stub.summary,
                 "image_url": stub.image_url,
+                "error": message,
                 "text": None,
                 "content_hash": None,
                 "extraction_status": status,

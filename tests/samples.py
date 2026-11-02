@@ -53,6 +53,13 @@ RELEASES_SECTIONS = (
     ("Third section heading", "Third section paragraph."),
 )
 
+COMMERCE_LISTING_URL = "https://www.commerce.gov/reports"
+COMMERCE_LISTING_CAPTURE = "20261015120000"
+COMMERCE_PDF_URLS = (
+    "https://www.commerce.gov/sites/default/files/2025-01/annual-report.pdf",
+    "https://www.commerce.gov/sites/default/files/2025-01/annual-report-appendix.pdf",
+)
+
 
 def listing_html(
     *,
@@ -132,6 +139,7 @@ def commerce_record(
     subtitle: str | None = None,
     news_types: Sequence[str] = ("Reports",),
     post_date: object = "2026-01-15",
+    post_date_formatted: object = None,
     created: object = 1768435200,
     documents: Sequence[dict[str, object]] | None = None,
     image: object = None,
@@ -147,7 +155,7 @@ def commerce_record(
         "subtitle": subtitle,
         "news_type": [{"id": str(index), "label": label} for index, label in enumerate(news_types, start=1)],
         "post_date": post_date,
-        "post_date_formatted": None,
+        "post_date_formatted": post_date_formatted,
         "created": created,
         "updated": created,
         "documents": list(documents or []),
@@ -277,9 +285,6 @@ def detail_html_en(
         with_container=with_container,
         with_title_block=with_title_block,
     )
-
-
-
 
 
 def commerce_listing_row(

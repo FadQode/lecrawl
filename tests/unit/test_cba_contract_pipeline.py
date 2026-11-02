@@ -61,7 +61,13 @@ def build_fetcher(
     pages: dict[str, bytes] = {ARTICLE_URL: article_html if article_html is not None else cba_article_html()}
     for url, payload in (pdf_payloads or {PDF_A: build_pdf("First pdf body")}).items():
         pages[url] = payload
-    return StubFetcher(pages, failures=failures or {}, content_type="application/json", post_responses=[listing])
+    return StubFetcher(
+        pages,
+        failures=failures or {},
+        content_type="application/json",
+        content_types={url: "application/pdf" for url in pages if url.endswith(".pdf")},
+        post_responses=[listing],
+    )
 
 
 def test_actor_maps_a_release_with_one_pdf() -> None:
@@ -70,6 +76,7 @@ def test_actor_maps_a_release_with_one_pdf() -> None:
 
     assert document.source == "cba_news_releases"
     assert document.source_url == ARTICLE_URL
+    assert document.native_id == "sample-release"
     assert document.type_of_law == "News Releases"
     assert document.topics == ("#Mortgages",)
     assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
@@ -130,6 +137,8 @@ def test_actor_keeps_the_article_when_one_pdf_fails() -> None:
     assert pdfs[1].error is not None
     assert any("pdf processing failed" in message for message in result.errors)
     assert result.records_without_text == 0
+    assert (result.resources_discovered, result.resources_processed) == (3, 3)
+    assert (result.resources_extracted, result.resources_failed, result.resources_skipped) == (1, 1, 1)
 
 
 def test_actor_marks_a_missing_pdf_as_url_unavailable() -> None:

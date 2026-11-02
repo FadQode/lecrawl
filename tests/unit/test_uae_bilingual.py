@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import pytest
+
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
 from lexcrawl.crawling.base import AccessBlockedError, FetchError
 from lexcrawl.models.document import TEXT_BEGIN_MARKER
@@ -87,6 +91,29 @@ def test_both_languages_complete() -> None:
     assert english.content_hash != document.content_hash
 
 
+def test_unexpected_localization_error_is_isolated_to_one_logical_article(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """### A localization bug does not discard successful sibling articles."""
+    actor = build_actor()
+    original = actor._collect_localization
+
+    def fail_one(fetcher: Any, *, stub: Any, language: str, listing_url: str | None) -> Any:
+        if stub.url == AR_ARTICLE:
+            raise ValueError("malformed localization state")
+        return original(fetcher, stub=stub, language=language, listing_url=listing_url)
+
+    monkeypatch.setattr(actor, "_collect_localization", fail_one)
+    result = actor.run(build_fetcher(cards=2))
+    assert len(result.documents) == 2
+    assert result.documents[0].text is not None
+    assert result.documents[0].language == "en"
+    assert result.documents[0].translations[0].status == "failed"
+    assert result.documents[1].text is not None
+    assert result.status == "partial_failure"
+    assert any("localization extraction failed" in error for error in result.errors)
+
+
 def test_english_blocked_keeps_arabic() -> None:
     """### A blocked translation preserves the Arabic document and states the block."""
     result = build_actor().run(build_fetcher(cards=1, failures={EN_ARTICLE: BLOCKED}))
@@ -98,7 +125,9 @@ def test_english_blocked_keeps_arabic() -> None:
     document = result.documents[0]
     assert document.language == "ar"
     assert document.text is not None
-    assert document.translations == ()
+    assert len(document.translations) == 1
+    assert document.translations[0].status == "access_blocked"
+    assert document.translations[0].error is not None
     assert any("access_blocked" not in message and "refused the request" in message for message in result.errors)
 
 
@@ -111,7 +140,8 @@ def test_arabic_blocked_keeps_english() -> None:
     assert document.language == "en"
     assert document.source_url == EN_ARTICLE
     assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
-    assert document.translations == ()
+    assert len(document.translations) == 1
+    assert document.translations[0].status == "access_blocked"
     assert document.content_hash is not None
 
 
@@ -124,6 +154,7 @@ def test_malformed_english_keeps_arabic_and_reports_the_error() -> None:
     assert document.text is not None
     assert result.records_missing_required_fields == 1
     assert any("article parse failed" in message for message in result.errors)
+    assert document.translations[0].status == "failed"
 
 
 def test_both_languages_blocked_stores_metadata_only() -> None:
@@ -140,6 +171,7 @@ def test_both_languages_blocked_stores_metadata_only() -> None:
     assert document.content_hash is None
     assert document.source_url == AR_ARTICLE
     assert document.title
+    assert {item.status for item in document.translations} == {"access_blocked"}
 
 
 def test_missing_translation_page_is_marked_unavailable() -> None:
@@ -149,7 +181,8 @@ def test_missing_translation_page_is_marked_unavailable() -> None:
     document = result.documents[0]
 
     assert document.language == "ar"
-    assert document.translations == ()
+    assert len(document.translations) == 1
+    assert document.translations[0].status == "unavailable"
     assert result.detail_pages_failed == 1
 
 
@@ -209,5 +242,6 @@ def test_arabic_only_mode_keeps_the_previous_behaviour() -> None:
     assert result.detail_pages_attempted == 2
     assert len(result.documents) == 2
     assert all(document.language == "ar" for document in result.documents)
-    assert all(document.translations == () for document in result.documents)
+    assert all(len(document.translations) == 1 for document in result.documents)
+    assert all(document.translations[0].status == "not_configured" for document in result.documents)
     assert result.status == "success"

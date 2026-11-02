@@ -82,6 +82,8 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             news_types=split_list(settings.reports_news_types),
             max_pages=arguments.max_pages if arguments.max_pages is not None else settings.reports_max_pages,
             page_size=settings.reports_page_size,
+            max_pdf_bytes=settings.pdf_max_bytes,
+            pdf_timeout_seconds=settings.pdf_extraction_timeout_seconds,
         )
     if name == "cba":
         return CbaNewsReleasesActor(
@@ -190,6 +192,9 @@ def render_summary(report: CrawlRunReport) -> str:
             f"filtered={result.records_filtered_out} "
             f"missing_required={result.records_missing_required_fields} "
             f"metadata_only={result.records_without_text} "
+            f"resources={result.resources_processed}/{result.resources_discovered} "
+            f"resource_extracted={result.resources_extracted} unavailable={result.resources_unavailable} "
+            f"failed={result.resources_failed} skipped={result.resources_skipped} "
             f"pagination_complete={result.pagination_complete}"
         )
         lines.extend(f"    error: {error}" for error in result.errors)

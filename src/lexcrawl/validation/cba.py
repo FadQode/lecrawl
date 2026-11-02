@@ -7,7 +7,7 @@ from datetime import date
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from lexcrawl.models.document import (
     CanonicalDocument,
@@ -65,10 +65,13 @@ class CbaResource(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     title: str
+    native_id: str | None = None
     original_url: str | None = None
     resource_type: ResourceType = "other"
     mime_type: str | None = None
     file_size: int | None = None
+    page_count: int | None = Field(default=None, ge=0)
+    character_count: int | None = Field(default=None, ge=0)
     extracted_text: str | None = None
     content_hash: str | None = None
     extraction_status: ResourceStatus = "pending"
@@ -104,6 +107,8 @@ class CbaResource(BaseModel):
                 raise ValueError("complete resource extraction requires a content hash")
             if self.content_hash != compute_content_hash(text):
                 raise ValueError("resource content hash does not match the extracted text")
+            if self.character_count is not None and self.character_count != len(text):
+                raise ValueError("resource character count does not match the extracted text")
         elif self.extracted_text is not None:
             raise ValueError(f"status {self.extraction_status!r} must not carry extracted text")
         return self
@@ -340,9 +345,11 @@ def to_canonical(release: CbaNewsRelease) -> CanonicalDocument:
     """### Adapt a validated news release to the canonical contract."""
     return CanonicalDocument(
         source=release.source,
+        native_id=release.native_id,
         source_url=release.source_url,
         title=release.title,
         language=OUTPUT_LANGUAGE,
+        extraction_status="complete" if release.text is not None else "failed",
         text=release.text,
         content_hash=release.content_hash,
         published_at=release.published_at,
@@ -353,6 +360,8 @@ def to_canonical(release: CbaNewsRelease) -> CanonicalDocument:
         resources=tuple(
             DocumentResource(
                 title=resource.display_title or resource.title,
+                native_id=resource.native_id,
+                parent_identity=f"{release.source}:id:{release.native_id}" if release.native_id else None,
                 url=resource.original_url,
                 kind=resource.resource_type,
                 text=resource.extracted_text,
@@ -360,6 +369,8 @@ def to_canonical(release: CbaNewsRelease) -> CanonicalDocument:
                 display_title=resource.display_title,
                 mime_type=resource.mime_type,
                 file_size=resource.file_size,
+                page_count=resource.page_count,
+                character_count=resource.character_count,
                 content_hash=resource.content_hash,
                 status=resource.extraction_status,
             )

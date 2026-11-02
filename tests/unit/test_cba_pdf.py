@@ -10,6 +10,7 @@ import pytest
 from lexcrawl.pipeline.pdf import (
     PdfExtractionError,
     _run_bounded_extraction,
+    extract_pdf,
     extract_pdf_text,
     is_pdf_resource,
     resource_kind,
@@ -49,10 +50,51 @@ def test_multi_page_pdf_text_is_joined() -> None:
     assert "Second page" in text
 
 
+def test_structured_result_preserves_page_boundaries_and_metadata() -> None:
+    """### Structured output records normalized text, counts, hash, and status."""
+    result = extract_pdf(build_pdf("First page", "Second page"), max_bytes=LIMIT)
+
+    assert result.extraction_status == "complete"
+    assert result.extracted_text is not None
+    assert "First page\n\nSecond page" in result.extracted_text
+    assert result.page_count == 2
+    assert result.character_count == len(result.extracted_text)
+    assert result.content_hash
+
+
+def test_structured_result_reports_failures_without_empty_success() -> None:
+    """### Malformed content becomes an explicit failed result with a reason."""
+    result = extract_pdf(b"%PDF-1.7 invalid", max_bytes=LIMIT)
+
+    assert result.extraction_status == "failed"
+    assert result.extracted_text is None
+    assert result.content_hash is None
+    assert result.error_message
+
+
 def test_pdf_without_text_is_reported() -> None:
     """### A PDF with no extractable text raises instead of returning empty text."""
     with pytest.raises(PdfExtractionError, match="no extractable text"):
         extract_pdf_text(build_pdf(), max_bytes=LIMIT)
+
+
+def test_encrypted_pdf_returns_an_explicit_failure() -> None:
+    """### Encrypted documents that cannot be opened are reported as failed."""
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Secret report")
+    payload = document.tobytes(
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        owner_pw="owner-password",
+        user_pw="user-password",
+    )
+    document.close()
+
+    result = extract_pdf(payload, max_bytes=LIMIT)
+
+    assert result.extraction_status == "failed"
+    assert result.extracted_text is None
+    assert result.error_message
 
 
 def test_empty_payload_is_rejected() -> None:

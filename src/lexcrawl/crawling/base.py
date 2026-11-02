@@ -62,6 +62,10 @@ class AccessBlockedError(FetchError):
         self.reason = reason
 
 
+class AccessDeniedError(FetchError):
+    """### An ordinary HTTP authorization denial, distinct from bot protection."""
+
+
 class RobotsDisallowedError(FetchError):
     """### The published robots policy does not allow fetching this URL."""
 
@@ -126,7 +130,12 @@ def redact_url(url: str) -> str:
     return urlunparse(parts._replace(query=urlencode(query)))
 
 
-def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
+def validate_http_url(
+    url: str,
+    *,
+    allowed_hosts: tuple[str, ...] = (),
+    allow_private_hosts: tuple[str, ...] = (),
+) -> str:
     """### Validate a request destination and optional hostname allowlist."""
     parts = urlparse(url)
     host = (parts.hostname or "").lower().rstrip(".")
@@ -138,7 +147,8 @@ def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
-    if address is not None and not address.is_global:
+    permitted_private = {value.lower().rstrip(".") for value in allow_private_hosts}
+    if address is not None and not address.is_global and host not in permitted_private:
         raise FetchError("non-public IP destinations are not allowed", url=url)
     if allowed_hosts:
         permitted = {value.lower().rstrip(".") for value in allowed_hosts}

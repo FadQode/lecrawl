@@ -102,6 +102,8 @@ def test_summary_reports_measured_counters() -> None:
     assert sources[0]["source"] == "uae_legislation_news"
     assert sources[0]["errors"] == []
     assert "detail_pages_succeeded" in sources[0]
+    assert sources[0]["resources_discovered"] == 0
+    assert sources[0]["resources_processed"] == 0
 
 
 def test_run_report_duration_is_measured() -> None:

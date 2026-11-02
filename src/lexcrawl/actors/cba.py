@@ -13,20 +13,21 @@ from bs4.element import Tag
 
 from lexcrawl.actors.base import Actor, ActorRunResult
 from lexcrawl.config import required_setting
-from lexcrawl.crawling.base import AccessBlockedError, Fetcher, FetchError
+from lexcrawl.crawling.base import AccessBlockedError, AccessDeniedError, Fetcher, FetchError
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import (
     ArticleContentError,
     ArticleStub,
     CanonicalDocument,
     DocumentResource,
+    DocumentStatus,
     RawArticle,
     ResourceStatus,
     compute_content_hash,
     ensure_text_marker,
 )
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
-from lexcrawl.pipeline.pdf import PdfExtractionError, extract_pdf_text, resource_kind
+from lexcrawl.pipeline.pdf import PdfExtractionError, extract_pdf, is_pdf_content_type, resource_kind
 from lexcrawl.validation.cba import (
     SOURCE_NAME as CONTRACT_SOURCE_NAME,
 )
@@ -407,8 +408,12 @@ class CbaNewsReleasesActor(Actor):
         result = ActorRunResult(source=self.source_name)
         state = _RunState()
 
-        self._walk_listing(fetcher, state, result)
-        self._enrich(fetcher, state, result)
+        try:
+            self._walk_listing(fetcher, state, result)
+            self._enrich(fetcher, state, result)
+        except Exception as error:
+            self._logger.exception("actor_phase_failed", extra={"source": self.source_name})
+            result.add_error(f"unexpected actor phase failure: {error!r}")
 
         result.pagination_complete = state.pagination_complete
         result.duration_seconds = time.monotonic() - started_at
@@ -476,42 +481,58 @@ class CbaNewsReleasesActor(Actor):
         for record in state.discovered.values():
             result.detail_pages_attempted += 1
             try:
-                page = fetcher.fetch(record.url)
-                article = parse_article(page.content, record.url)
-            except FetchError as error:
-                result.detail_pages_failed += 1
-                result.add_error(f"article fetch failed at {record.url}: {error}")
-                result.documents.append(self._metadata_only(record, result))
-                continue
-            except ArticleContentError as error:
+                self._enrich_record(fetcher, record, result)
+            except Exception as error:
+                self._logger.exception("release_materialization_failed", extra={"url": record.url})
                 result.detail_pages_failed += 1
                 result.records_missing_required_fields += 1
-                result.add_error(f"article parse failed at {record.url}: {error}")
-                result.documents.append(self._metadata_only(record, result))
-                continue
+                result.add_error(f"release materialization failed at {record.url}: {error!r}")
+                result.documents.append(self._metadata_only(record, result, error=repr(error)))
 
-            self._apply_listing_fallbacks(article, record)
-            release = self._build_release(fetcher, article, record, result)
-            validation = validate_release(release, expected_host=self.article_host)
-            for issue in validation.article.errors:
-                result.add_error(f"{record.url} {issue.field} {issue.code}: {issue.message}")
-            for issue in validation.article.warnings:
-                self._logger.warning("release_warning", extra={"url": record.url, "code": issue.code})
-            for index, report in enumerate(validation.resources):
-                for issue in report.errors:
-                    result.add_error(f"{record.url} resources.{index} {issue.code}: {issue.message}")
-                for issue in report.warnings:
-                    self._logger.warning(
-                        "resource_warning",
-                        extra={"url": record.url, "index": index, "code": issue.code},
-                    )
-            if not validation.ok:
-                # $ A release that fails article validation keeps only its discovery metadata.$
-                result.records_missing_required_fields += 1
-                result.documents.append(self._metadata_only(record, result))
-                continue
-            result.detail_pages_succeeded += 1
-            result.documents.append(to_canonical(release))
+    def _enrich_record(self, fetcher: Fetcher, record: CbaRecord, result: ActorRunResult) -> None:
+        """### Fetch, validate and canonicalize one release without affecting siblings."""
+        try:
+            page = fetcher.fetch(record.url)
+            article = parse_article(page.content, record.url)
+        except FetchError as error:
+            result.detail_pages_failed += 1
+            result.add_error(f"article fetch failed at {record.url}: {error}")
+            status: DocumentStatus = (
+                "access_blocked"
+                if isinstance(error, (AccessBlockedError, AccessDeniedError))
+                else "unavailable"
+                if error.status_code in {404, 410}
+                else "failed"
+            )
+            result.documents.append(self._metadata_only(record, result, status=status, error=str(error)))
+            return
+        except ArticleContentError as error:
+            result.detail_pages_failed += 1
+            result.records_missing_required_fields += 1
+            result.add_error(f"article parse failed at {record.url}: {error}")
+            result.documents.append(self._metadata_only(record, result, error=str(error)))
+            return
+
+        self._apply_listing_fallbacks(article, record)
+        release = self._build_release(fetcher, article, record, result)
+        validation = validate_release(release, expected_host=self.article_host)
+        for issue in validation.article.errors:
+            result.add_error(f"{record.url} {issue.field} {issue.code}: {issue.message}")
+        for issue in validation.article.warnings:
+            self._logger.warning("release_warning", extra={"url": record.url, "code": issue.code})
+        for index, report in enumerate(validation.resources):
+            for issue in report.errors:
+                result.add_error(f"{record.url} resources.{index} {issue.code}: {issue.message}")
+            for issue in report.warnings:
+                self._logger.warning("resource_warning", extra={"url": record.url, "index": index, "code": issue.code})
+        if not validation.ok:
+            # $ A release that fails article validation keeps only its discovery metadata.$
+            result.records_missing_required_fields += 1
+            result.documents.append(self._metadata_only(record, result))
+            return
+        document = to_canonical(release)
+        result.detail_pages_succeeded += 1
+        result.documents.append(document)
 
     def _apply_listing_fallbacks(self, article: RawArticle, record: CbaRecord) -> None:
         """### Fill gaps in the article page from the listing record."""
@@ -522,10 +543,17 @@ class CbaNewsReleasesActor(Actor):
         if not article.image_url and record.image_url:
             article.image_url = record.image_url
 
-    def _metadata_only(self, record: CbaRecord, result: ActorRunResult) -> CanonicalDocument:
+    def _metadata_only(
+        self,
+        record: CbaRecord,
+        result: ActorRunResult,
+        *,
+        status: DocumentStatus = "failed",
+        error: str | None = None,
+    ) -> CanonicalDocument:
         """### Store discovery metadata for an article that could not be enriched."""
         result.records_without_text += 1
-        return CanonicalDocument.from_listing_entry(
+        document = CanonicalDocument.from_listing_entry(
             ArticleStub(
                 url=record.url,
                 title=record.title,
@@ -536,7 +564,11 @@ class CbaNewsReleasesActor(Actor):
             source=self.source_name,
             language=OUTPUT_LANGUAGE,
             type_of_law=self.type_label,
+            native_id=record.slug,
+            extraction_status=status,
+            extraction_error=error,
         )
+        return document
 
     def _build_release(
         self,
@@ -575,7 +607,15 @@ class CbaNewsReleasesActor(Actor):
                 self._logger.info("resource_deduplicated", extra={"url": resource.url, "title": resource.title})
                 continue
             unique[key] = resource
-        collected = tuple(self._resource_from(fetcher, resource, result) for resource in unique.values())
+        result.discover_resources(len(unique))
+        collected_items = []
+        for resource in unique.values():
+            processed = self._resource_from(fetcher, resource, result)
+            result.account_resource(processed.extraction_status)
+            if processed.extraction_status == "url_unavailable":
+                result.add_error(f"resource URL unavailable: {processed.title}")
+            collected_items.append(processed)
+        collected = tuple(collected_items)
         return display_titles(collected)
 
     def _resource_from(
@@ -604,12 +644,20 @@ class CbaNewsReleasesActor(Actor):
             )
         try:
             page = fetcher.fetch_binary(resource.url, max_bytes=self.max_pdf_bytes)
-            text = extract_pdf_text(
+            if page.status_code is not None and not 200 <= page.status_code < 300:
+                raise FetchError(
+                    "PDF response returned an unsuccessful HTTP status",
+                    url=resource.url,
+                    status_code=page.status_code,
+                )
+            if not is_pdf_content_type(page.content_type):
+                raise PdfExtractionError("response content type is not PDF")
+            extraction = extract_pdf(
                 page.content,
                 max_bytes=self.max_pdf_bytes,
                 timeout_seconds=self.pdf_timeout_seconds,
             )
-        except AccessBlockedError as error:
+        except (AccessBlockedError, AccessDeniedError) as error:
             return self._failed_resource(resource, "access_blocked", str(error), result)
         except PdfExtractionError as error:
             return self._failed_resource(resource, "failed", str(error), result)
@@ -618,16 +666,24 @@ class CbaNewsReleasesActor(Actor):
                 "url_unavailable" if getattr(error, "status_code", None) in {404, 410} else "failed"
             )
             return self._failed_resource(resource, status, str(error), result)
+        if extraction.extracted_text is None:
+            return self._failed_resource(
+                resource,
+                "failed",
+                extraction.error_message or "PDF extraction failed",
+                result,
+            )
 
-        marked = ensure_text_marker(text)
         return CbaResource(
             title=resource.title,
             original_url=resource.url,
             resource_type="pdf",
-            mime_type="application/pdf",
+            mime_type=page.content_type or "application/pdf",
             file_size=len(page.content),
-            extracted_text=marked,
-            content_hash=compute_content_hash(marked),
+            extracted_text=extraction.extracted_text,
+            content_hash=extraction.content_hash,
+            page_count=extraction.page_count,
+            character_count=extraction.character_count,
             extraction_status="complete",
         )
 

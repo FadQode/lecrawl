@@ -277,6 +277,25 @@ def test_to_canonical_prefers_arabic() -> None:
     assert document.translations[0].text.startswith(TEXT_BEGIN_MARKER)
 
 
+def test_to_canonical_preserves_pending_localization_state() -> None:
+    """### A pending translation remains linked without claiming extracted content."""
+    pending = localization(language="en", url=EN_URL, status="pending", text=None)
+    document = to_canonical(build_article(primary=localization(status="complete"), en=pending))
+    assert document is not None
+    translation = document.translations[0]
+    assert translation.status == "pending"
+    assert translation.text is None and translation.content_hash is None
+    assert translation.parent_identity == document.identity_key
+
+
+def test_to_canonical_can_mark_unconfigured_language() -> None:
+    """### A disabled language is distinct from a failed extraction."""
+    document = to_canonical(build_article(primary=localization(status="complete")), include_unconfigured_english=True)
+    assert document is not None
+    assert document.translations[0].status == "not_configured"
+    assert document.translations[0].source_url is None
+
+
 def test_to_canonical_falls_back_to_english() -> None:
     """### When Arabic is blocked, the English localization is preserved."""
     arabic = localization(status="access_blocked", text=None)
@@ -287,7 +306,9 @@ def test_to_canonical_falls_back_to_english() -> None:
     assert document.language == "en"
     assert document.source_url == EN_URL
     assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
-    assert document.translations == ()
+    assert len(document.translations) == 1
+    assert document.translations[0].language == "ar"
+    assert document.translations[0].status == "access_blocked"
 
 
 def test_to_canonical_returns_none_without_content() -> None:

@@ -11,7 +11,9 @@ from lexcrawl.models.document import (
     TEXT_BEGIN_MARKER,
     ArticleStub,
     CanonicalDocument,
+    DocumentResource,
     RawArticle,
+    compute_content_hash,
     ensure_text_marker,
 )
 
@@ -112,3 +114,42 @@ def test_every_collected_text_starts_with_the_marker() -> None:
     assert with_text.text is not None and with_text.text.startswith(TEXT_BEGIN_MARKER)
     assert with_text.text.count(TEXT_BEGIN_MARKER) == 1
     assert without_text.text is None
+
+
+def test_canonical_identity_uses_native_id_and_scopes_resources() -> None:
+    """### Native document and attachment IDs produce stable parent-scoped keys."""
+    document = CanonicalDocument(
+        source="commerce_reports",
+        native_id="report-7",
+        source_url="https://commerce.example.test/news/report-7",
+        title="Report",
+        language="en",
+        resources=(DocumentResource(title="Report PDF", native_id="file-2", url="https://files.example.test/a.pdf"),),
+    )
+    assert document.identity_key == "commerce_reports:id:report-7"
+    assert document.resources[0].identity_key == "commerce_reports:id:report-7:resource:id:file-2"
+    assert document.resources[0].parent_identity == document.identity_key
+
+
+def test_canonical_url_fallback_ignores_fragment() -> None:
+    """### URL identity is deterministic when the source has no native ID."""
+    document = CanonicalDocument(
+        source="cba_news_releases",
+        source_url="https://example.test/news?id=4#section",
+        title="News",
+        language="en",
+    )
+    assert document.identity_key == "cba_news_releases:url:https://example.test/news?id=4"
+
+
+def test_canonical_rejects_mismatched_text_hash() -> None:
+    """### Canonical producers cannot bypass the common hash invariant."""
+    with pytest.raises(ValidationError, match="content hash"):
+        CanonicalDocument(
+            source="test",
+            source_url="https://example.test/a",
+            title="A",
+            language="en",
+            text="TEXT-BEGIN\nBody",
+            content_hash=compute_content_hash("TEXT-BEGIN\nOther"),
+        )
