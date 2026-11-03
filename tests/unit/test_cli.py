@@ -33,6 +33,7 @@ def build_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "listings_url": LISTING_URL,
         "listings_language": "ar",
+        "reports_listing_url": "https://www.commerce.gov/data-and-reports/reports",
         "reports_api_url": REPORTS_API_URL,
         "reports_api_key": "TEST_KEY",
         "reports_article_host": REPORTS_HOST,
@@ -293,3 +294,19 @@ def test_crawl_without_persist_does_not_touch_the_database(
     monkeypatch.setattr("lexcrawl.cli.persist_report", forbidden)
     arguments = ["crawl", "--source", "uae", "--out", str(tmp_path), "--log-format", "console"]
     assert main(arguments, build_settings()) == 0
+
+
+def test_commerce_actor_uses_firecrawl_with_explicit_bootstrap() -> None:
+    """### The Commerce actor is wired to Firecrawl and an explicit bootstrap flag."""
+    from lexcrawl.actors.commerce import CommerceReportsActor
+
+    settings = build_settings()
+    default_actor = build_actor("commerce", parse(["crawl"]), settings)
+    bootstrap_actor = build_actor("commerce", parse(["crawl", "--bootstrap"]), settings)
+
+    assert isinstance(default_actor, CommerceReportsActor)
+    assert isinstance(bootstrap_actor, CommerceReportsActor)
+    assert default_actor.bootstrap is False
+    assert bootstrap_actor.bootstrap is True
+    assert default_actor.firecrawl is not None
+    assert default_actor.listing_url == settings.reports_listing_url

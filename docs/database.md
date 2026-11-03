@@ -67,6 +67,10 @@ erDiagram
   only replaced by newer content, so a blocked or failed refresh cannot erase the last good text
   (enforced by the *pairing* check, not by forbidding text on non-complete statuses).
 - `last_attempt_at` advances on every attempt; `fetched_at` only on a completed one.
+- **Bounded retry accounting.** `documents.extraction_attempts` increments each time an
+  incomplete document is persisted and resets to `0` when it completes. `incomplete_reports`
+  selects rows whose status is not `complete` and whose attempts are below the configured
+  budget, so a permanently inaccessible report is retried only a finite number of times.
 - Resources follow the same rules: a failed extraction keeps the previously extracted text and
   hash while recording `extraction_status='failed'` and `extraction_error`.
 - URL-less attachments are persisted with `original_url = NULL` and
@@ -115,6 +119,7 @@ erDiagram
 | `archive_url`, `archived_at`, `archive_listing_url` | same names | unchanged | nullable |
 | `extraction_status` | `documents.extraction_status` | unchanged | nullable |
 | `extraction_error` | `documents.extraction_error` (+ `crawl_errors` row) | redacted | nullable |
+| (derived) | `documents.extraction_attempts` | `0` when the status is `complete`, otherwise `+1` on each update | required (default `0`) |
 | `title`, `language`, `summary`, `text`, `content_hash` | `document_localizations.*` (primary row) | `text` unchanged (`TEXT-BEGIN`) | `title` nullable for translations, `text`/hash nullable |
 | `extraction_status` (primary) | `document_localizations.status` | `None` → `complete` if text, else `pending` | required |
 | `translations[]` | additional `document_localizations` rows | one row per language | `language` unique per document |
@@ -132,6 +137,9 @@ erDiagram
 | `ActorRunResult.*` counters | `crawl_run_sources.*` | 1:1, plus `documents_processed = len(documents)` and `documents_failed = detail_pages_failed` | required, non-negative |
 | `ActorRunResult.errors` | `crawl_errors` (stage `unknown`, type `actor_error`) | redacted, 2000-char cap | required message |
 | `ActorRunResult.documents` | `documents` + localizations + resources | as above | — |
+| `ActorRunResult.check_outcome` | `crawl_run_sources.check_outcome` | unchanged (`no_change`/`new_data`/`check_failed`/NULL) | nullable |
+| `ActorRunResult.documents_pending` | `crawl_run_sources.documents_pending` | unchanged | required, non-negative |
+| `ActorRunResult.provider_credits_used` | `crawl_run_sources.provider_credits_used` | unchanged | required, non-negative |
 | `RawArticle`, `ArticleStub` | — | pre-canonical intermediates, never persisted | — |
 
 **Intentionally not persisted:** `parent_identity` values (derivable from the parent row), raw
@@ -182,6 +190,11 @@ database.
 
 ## Known limitations
 
+- A verified no-change run is stored as a successful source run with `check_outcome=no_change`
+  and zero documents; a failed preflight is `check_failed` with a failed status.
+- `documents_pending` records work deferred by the Firecrawl detail budget, so a later run can
+  resume it through the normal identity comparison.
+- `provider_credits_used` stores the credits Firecrawl reported for that source run.
 - `documents_failed` mirrors `detail_pages_failed`; its unit differs per source (UAE
   localizations, CBA releases, Commerce reports) and is documented on `ActorRunResult`.
 - `content_fetched_at` was merged into `fetched_at`: the canonical contract has one "last

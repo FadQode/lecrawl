@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from lexcrawl.db.models import Document
+from lexcrawl.db.models import Document, DocumentLocalization, Source
 from lexcrawl.models.document import CanonicalDocument
 from lexcrawl.repositories.mapping import document_values
 
@@ -49,6 +50,11 @@ def upsert_document(
             ),
             "extraction_status": insert_statement.excluded.extraction_status,
             "extraction_error": insert_statement.excluded.extraction_error,
+            # $ A completed extraction resets the counter; an incomplete one advances it.$
+            "extraction_attempts": case(
+                (insert_statement.excluded.extraction_status == "complete", 0),
+                else_=Document.extraction_attempts + 1,
+            ),
             "last_seen_at": now,
             "updated_at": now,
         },
@@ -61,3 +67,76 @@ def find_document(session: Session, *, source_id: int, identity_key: str) -> Doc
     return session.execute(
         select(Document).where(Document.source_id == source_id, Document.identity_key == identity_key)
     ).scalar_one_or_none()
+
+
+def known_identity_keys(session: Session, *, source_code: str) -> set[str]:
+    """### Return every persisted identity key for one source."""
+    statement = (
+        select(Document.identity_key).join(Source, Document.source_id == Source.id).where(Source.code == source_code)
+    )
+    return set(session.execute(statement).scalars())
+
+
+@dataclass(frozen=True, slots=True)
+class IncompleteReport:
+    """### One persisted report whose detail extraction is not complete yet."""
+
+    identity: str
+    url: str
+    title: str
+    published_date_raw: str | None
+    published_month: int | None
+    published_year: int | None
+    attempts: int
+
+
+def incomplete_reports(
+    session: Session,
+    *,
+    source_code: str,
+    max_attempts: int,
+    limit: int | None = None,
+) -> list[IncompleteReport]:
+    """### Return reports whose bounded retry budget is not yet spent."""
+    primary_title = (
+        select(DocumentLocalization.title)
+        .where(DocumentLocalization.document_id == Document.id)
+        .order_by(DocumentLocalization.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    statement = (
+        select(
+            Document.identity_key,
+            Document.source_url,
+            primary_title,
+            Document.published_date_raw,
+            Document.published_month,
+            Document.published_year,
+            Document.extraction_attempts,
+        )
+        .join(Source, Document.source_id == Source.id)
+        .where(
+            Source.code == source_code,
+            # $ NULL status is treated as incomplete so legacy rows are not skipped.$
+            (Document.extraction_status.is_(None)) | (Document.extraction_status != "complete"),
+            Document.extraction_attempts < max_attempts,
+        )
+        .order_by(Document.updated_at)
+    )
+    if limit is not None:
+        statement = statement.limit(limit)
+    reports: list[IncompleteReport] = []
+    for identity, url, title, date_raw, month, year, attempts in session.execute(statement).all():
+        reports.append(
+            IncompleteReport(
+                identity=str(identity),
+                url=str(url),
+                title=str(title).strip() if title else str(url),
+                published_date_raw=str(date_raw) if date_raw else None,
+                published_month=int(month) if month is not None else None,
+                published_year=int(year) if year is not None else None,
+                attempts=int(attempts),
+            )
+        )
+    return reports

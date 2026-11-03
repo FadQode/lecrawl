@@ -57,6 +57,7 @@ class Document(Base):
             name="published_month_range",
         ),
         CheckConstraint("published_year IS NULL OR published_year BETWEEN 1800 AND 2100", name="published_year_range"),
+        CheckConstraint("extraction_attempts >= 0", name="extraction_attempts_non_negative"),
         CheckConstraint(f"provenance {sql_in(get_args(Provenance))}", name="provenance_values"),
         CheckConstraint(
             f"extraction_status IS NULL OR extraction_status {sql_in(get_args(DocumentStatus))}",
@@ -88,6 +89,7 @@ class Document(Base):
     archive_listing_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     extraction_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extraction_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

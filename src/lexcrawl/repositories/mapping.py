@@ -90,6 +90,11 @@ def document_status(document: CanonicalDocument) -> str:
     return "complete" if document.text is not None else "pending"
 
 
+def initial_extraction_attempts(document: CanonicalDocument) -> int:
+    """### Start the attempt counter at one for a document that is still incomplete."""
+    return 0 if document_status(document) == "complete" else 1
+
+
 def document_values(document: CanonicalDocument, *, now: datetime) -> dict[str, Any]:
     """### Build the insert/update values for one logical document row."""
     return {
@@ -112,6 +117,7 @@ def document_values(document: CanonicalDocument, *, now: datetime) -> dict[str, 
         "archive_listing_url": document.archive_listing_url,
         "extraction_status": document.extraction_status,
         "extraction_error": document.extraction_error,
+        "extraction_attempts": initial_extraction_attempts(document),
         "first_seen_at": now,
         "last_seen_at": now,
         "created_at": now,
@@ -213,6 +219,8 @@ def run_counters(result: ActorRunResult) -> dict[str, int]:
         "resources_skipped": result.resources_skipped,
         "documents_processed": len(result.documents),
         "documents_failed": result.detail_pages_failed,
+        "documents_pending": result.documents_pending,
+        "provider_credits_used": result.provider_credits_used,
     }
 
 

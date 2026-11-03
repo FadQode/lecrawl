@@ -96,6 +96,8 @@ class HttpFetcher:
                 "User-Agent": user_agent,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ar,en;q=0.9",
+                # $ Only well-supported encodings, so proxy edge cases cannot corrupt a body.$
+                "Accept-Encoding": "gzip, deflate",
             },
         )
         self._owns_client = client is None

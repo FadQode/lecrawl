@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,9 +15,10 @@ from lexcrawl.actors.base import Actor
 from lexcrawl.actors.cba import CbaNewsReleasesActor
 from lexcrawl.actors.commerce import CommerceReportsActor
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
-from lexcrawl.config import Settings, get_settings, split_list
+from lexcrawl.config import Settings, get_settings
 from lexcrawl.crawling.base import Fetcher
 from lexcrawl.crawling.browser import BrowserFetcher
+from lexcrawl.crawling.firecrawl import FirecrawlClient
 from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.db.engine import create_db_engine
 from lexcrawl.db.seed import seed_sources
@@ -24,6 +26,7 @@ from lexcrawl.db.session import create_session_factory, session_scope
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
 from lexcrawl.persistence import persist_crawl_report
+from lexcrawl.repositories.documents import IncompleteReport, incomplete_reports, known_identity_keys
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 SOURCE_NAMES = ("uae", "commerce", "cba")
+COMMERCE_SOURCE_CODE = "commerce_reports"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--log-level", default=None)
     crawl.add_argument("--log-format", choices=["json", "console"], default=None)
     crawl.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="explicitly authorise discovery and acquisition of historical Commerce reports",
+    )
+    crawl.add_argument(
         "--persist",
         action="store_true",
         help="persist this run and its documents to PostgreSQL in addition to JSON output",
@@ -71,6 +80,55 @@ def build_parser() -> argparse.ArgumentParser:
     revision.add_argument("-m", "--message", required=True, help="revision message")
     database_commands.add_parser("seed", help="insert the source registry entries")
     return parser
+
+
+def build_firecrawl(settings: Settings) -> FirecrawlClient:
+    """### Build the Firecrawl scraper from validated settings."""
+    return FirecrawlClient(
+        api_key=settings.firecrawl_api_key,
+        api_url=settings.firecrawl_api_url,
+        timeout_seconds=settings.firecrawl_timeout_seconds,
+        max_retries=settings.firecrawl_max_retries,
+        request_delay_seconds=settings.firecrawl_request_delay_seconds,
+        cache_dir=settings.firecrawl_cache_dir or None,
+    )
+
+
+def known_identities_provider(settings: Settings) -> Callable[[], set[str]]:
+    """### Build a lazy lookup of persisted Commerce report identities."""
+
+    def lookup() -> set[str]:
+        """### Read the persisted identities for the Commerce source."""
+        engine = create_db_engine(settings)
+        factory = create_session_factory(engine)
+        try:
+            with session_scope(factory) as session:
+                return known_identity_keys(session, source_code=COMMERCE_SOURCE_CODE)
+        finally:
+            engine.dispose()
+
+    return lookup
+
+
+def incomplete_reports_provider(settings: Settings) -> Callable[[], list[IncompleteReport]]:
+    """### Build a lazy lookup of incomplete Commerce reports eligible for retry."""
+
+    def lookup() -> list[IncompleteReport]:
+        """### Read the incomplete reports whose retry budget is not yet spent."""
+        engine = create_db_engine(settings)
+        factory = create_session_factory(engine)
+        try:
+            with session_scope(factory) as session:
+                return incomplete_reports(
+                    session,
+                    source_code=COMMERCE_SOURCE_CODE,
+                    max_attempts=settings.firecrawl_incomplete_max_attempts,
+                    limit=settings.firecrawl_incomplete_retries_per_run,
+                )
+        finally:
+            engine.dispose()
+
+    return lookup
 
 
 def crawl_engine(arguments: argparse.Namespace, settings: Settings) -> str:
@@ -96,14 +154,17 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             secondary_listing_url=settings.listings_secondary_url,
         )
     if name == "commerce":
+        # $ Firecrawl is bounded by explicit page and detail-scrape budgets.$
         return CommerceReportsActor(
-            api_url=settings.reports_api_url,
-            api_key=settings.reports_api_key,
-            article_host=settings.reports_article_host,
-            article_paths=split_list(settings.reports_article_paths),
-            news_types=split_list(settings.reports_news_types),
-            max_pages=arguments.max_pages if arguments.max_pages is not None else settings.reports_max_pages,
-            page_size=settings.reports_page_size,
+            listing_url=settings.reports_listing_url,
+            firecrawl=build_firecrawl(settings),
+            known_identities=known_identities_provider(settings),
+            incomplete_reports=incomplete_reports_provider(settings),
+            bootstrap=getattr(arguments, "bootstrap", False),
+            max_pages=arguments.max_pages if arguments.max_pages is not None else settings.firecrawl_max_pages_per_run,
+            max_detail_scrapes=settings.firecrawl_max_detail_scrapes_per_run,
+            max_incomplete_retries=settings.firecrawl_incomplete_retries_per_run,
+            min_body_words=settings.firecrawl_min_body_words,
             max_pdf_bytes=settings.pdf_max_bytes,
             pdf_timeout_seconds=settings.pdf_extraction_timeout_seconds,
         )
@@ -310,6 +371,10 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         return 2
     with closing(build_fetcher(arguments, settings)) as fetcher:
         report = run_crawl(actors, fetcher)
+    for actor in actors:
+        close = getattr(actor, "close", None)
+        if callable(close):
+            close()
 
     print(render_summary(report))
     if report.documents:

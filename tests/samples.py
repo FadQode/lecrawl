@@ -303,3 +303,85 @@ def commerce_listing_row(
         "report_url": f"https://www.commerce.gov/data-and-reports/reports/{year}/{month}/{slug}",
         "pdf_urls": list(pdf_urls),
     }
+
+
+COMMERCE_HOST = "www.commerce.gov"
+COMMERCE_LISTING_URL = "https://www.commerce.gov/data-and-reports/reports"
+COMMERCE_DETAIL_PREFIX = f"{COMMERCE_LISTING_URL}/"
+
+
+def commerce_listing_html(
+    rows: Sequence[tuple[str, str, str, Sequence[tuple[str, str, str]]]],
+    *,
+    start: int = 1,
+    end: int = 20,
+    total: int = 112,
+    with_table: bool = True,
+) -> str:
+    """### Build a Commerce reports listing page with the observed Drupal table markup."""
+    body_rows = []
+    for date_text, title, detail_path, files in rows:
+        file_cells = "".join(
+            f'<span class="file {mime}"><a href="{href}" title="{name}" type="{mime}">{name}</a></span>'
+            for href, name, mime in files
+        )
+        body_rows.append(
+            "<tr>"
+            '<td class="views-field-field-release-datetime">'
+            '<strong class="tablesaw-cell-label">Date</strong>'
+            f'<span class="tablesaw-cell-content">{date_text}</span></td>'
+            '<td class="views-field-title">'
+            '<strong class="tablesaw-cell-label">Title</strong>'
+            f'<span class="tablesaw-cell-content"><a href="{detail_path}">{title}</a></span></td>'
+            '<td class="views-field-field-media-file">'
+            '<strong class="tablesaw-cell-label">File(s)</strong>'
+            f'<span class="tablesaw-cell-content">{file_cells}</span></td>'
+            "</tr>"
+        )
+    table = (
+        '<table class="views-table"><thead><tr>'
+        '<th><a href="?sort=asc">Date <span>Sort ascending</span></a></th><th>Title</th><th>File(s)</th>'
+        f"</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+        if with_table
+        else "<p>No reports table available</p>"
+    )
+    return (
+        "<html><body><main>"
+        f'<div class="view-header">Displaying {start} - {end} of {total}</div>'
+        f"{table}"
+        "</main></body></html>"
+    )
+
+
+def commerce_detail_html(
+    title: str = "Sample Commerce report",
+    *,
+    date_iso: str = "2025-01-17T18:05:03Z",
+    date_text: str = "Friday, January 17, 2025",
+    paragraphs: Sequence[str] = (
+        "America has the best companies, the best innovators, and the best entrepreneurs in the world.",
+        "This report describes the department's work across four years of programmes and results.",
+        "It closes with recommendations for the next period of public investment and oversight.",
+    ),
+    attachments: Sequence[tuple[str, str, str]] = (),
+    with_article: bool = True,
+    with_title: bool = True,
+    with_time: bool = True,
+) -> str:
+    """### Build a Commerce report detail page with the observed article markup."""
+    heading = f"<h1>{title}</h1>" if with_title else ""
+    time_block = f'<time class="datetime" datetime="{date_iso}">{date_text}</time>' if with_time else ""
+    body = "".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    links = "".join(
+        f'<span class="file"><a href="{href}" type="{mime}">{name}</a></span>' for href, name, mime in attachments
+    )
+    article = (
+        f'<article data-history-node-id="1"><div>'
+        f'<div class="field field--name-field-release-datetime">{time_block}</div>'
+        f'<div class="clearfix field field--name-body field--type-text-with-summary">{body}</div>'
+        f"<div>{links}</div>"
+        f"</div>{heading}</article>"
+        if with_article
+        else f"<main>{heading}</main>"
+    )
+    return f"<html><head><title>Report</title></head><body><main>{article}</main></body></html>"

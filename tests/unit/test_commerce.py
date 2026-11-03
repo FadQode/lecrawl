@@ -1,73 +1,684 @@
-"""### Actor tests for the Commerce reports source."""
+"""### Commerce actor tests: cheap preflight, Firecrawl pagination, selective detail."""
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
 
-import pymupdf
 import pytest
 
 from lexcrawl.actors.commerce import (
-    CommerceApiError,
+    CommerceExtractionError,
     CommerceReportsActor,
+    InsufficientReportContent,
     build_page_url,
-    is_news_release,
-    parse_api_page,
-    with_api_key,
+    parse_detail,
+    parse_listing,
 )
-from lexcrawl.crawling.base import AccessBlockedError, FetchError
-from lexcrawl.models.document import TEXT_BEGIN_MARKER, CanonicalDocument
-from lexcrawl.validation.commerce import from_api_payload, is_report_url
+from lexcrawl.crawling.base import AccessBlockedError
+from lexcrawl.crawling.firecrawl import FirecrawlError, ScrapedPage
+from lexcrawl.models.document import TEXT_BEGIN_MARKER, compute_content_hash, stable_identity
+from lexcrawl.repositories.documents import IncompleteReport
+from lexcrawl.validation.commerce import SOURCE_NAME
 
 from ..conftest import StubFetcher
-from ..samples import REPORTS_API_URL, REPORTS_ARTICLE_PATHS, REPORTS_HOST, commerce_page, commerce_record
+from ..samples import (
+    COMMERCE_DETAIL_PREFIX,
+    COMMERCE_HOST,
+    COMMERCE_LISTING_URL,
+    commerce_detail_html,
+    commerce_listing_html,
+)
 
-FIRST_PAGE_URL = build_page_url(REPORTS_API_URL, api_key="TEST_KEY", page_size=50, offset=0)
-SCOPE = {"host": REPORTS_HOST, "path_prefixes": REPORTS_ARTICLE_PATHS}
+PAGE0 = build_page_url(COMMERCE_LISTING_URL, 0)
+PAGE1 = build_page_url(COMMERCE_LISTING_URL, 1)
+SCOPE = {"host": COMMERCE_HOST, "path_prefixes": ("/data-and-reports/reports/",)}
 
 
-def page_url(page_size: int, offset: int) -> str:
-    """### Build the API page URL the actor will request for a given size and offset."""
-    return build_page_url(REPORTS_API_URL, api_key="TEST_KEY", page_size=page_size, offset=offset)
+def identity(index: int) -> str:
+    """### Return the canonical identity for one sample report."""
+    return stable_identity(SOURCE_NAME, None, f"{COMMERCE_DETAIL_PREFIX}2025/01/report-{index}")
 
 
-def report_url(slug: str, *, year: str = "2026", month: str = "01", kind: str = "reports") -> str:
-    """### Build an in-scope report URL on the sample host."""
-    return f"https://{REPORTS_HOST}/{kind}/{year}/{month}/{slug}"
+def row(
+    index: int,
+    *,
+    date: str = "January 2025",
+    pdf: bool = False,
+) -> tuple[str, str, str, list[tuple[str, str, str]]]:
+    """### Build one listing row tuple, optionally with a PDF attachment."""
+    detail = f"/data-and-reports/reports/2025/01/report-{index}"
+    files = (
+        [(f"/sites/default/files/2025-01/report-{index}.pdf", f"report-{index}.pdf", "application/pdf")] if pdf else []
+    )
+    return date, f"Report {index}", detail, files
+
+
+def listing_page(
+    indexes: Sequence[int],
+    *,
+    start: int,
+    end: int,
+    total: int = 112,
+    pdf: bool = False,
+) -> str:
+    """### Build a listing page for the given report indexes."""
+    return commerce_listing_html([row(index, pdf=pdf) for index in indexes], start=start, end=end, total=total)
+
+
+def page_zero(*indexes: int, pdf: bool = False) -> str:
+    """### Build the first listing page with a 20-row source range."""
+    return listing_page(indexes or tuple(range(1, 21)), start=1, end=20, pdf=pdf)
+
+
+class FakeScraper:
+    """### Serve canned Firecrawl pages and record every call."""
+
+    def __init__(
+        self,
+        pages: dict[str, str | Exception],
+        *,
+        target_status: int | None = 200,
+        credits: int = 1,
+    ) -> None:
+        """### Store canned pages and the provider status to report."""
+        self._pages = pages
+        self._target_status = target_status
+        self._credits = credits
+        self.calls: list[tuple[str, bool]] = []
+
+    def scrape(self, url: str, *, cache: bool = False) -> ScrapedPage:
+        """### Return a canned page or raise a canned failure."""
+        self.calls.append((url, cache))
+        value = self._pages.get(url)
+        if value is None:
+            raise FirecrawlError("no canned page", url=url)
+        if isinstance(value, Exception):
+            raise value
+        return ScrapedPage(
+            requested_url=url,
+            provider_status=200,
+            target_status=self._target_status,
+            html=value,
+            markdown="",
+            credits_used=self._credits,
+        )
+
+    def urls(self) -> list[str]:
+        """### Return the scraped URLs in order."""
+        return [url for url, _ in self.calls]
 
 
 def build_actor(
-    *, page_size: int = 50, max_pages: int = 2, news_types: tuple[str, ...] = ("Reports",)
-) -> CommerceReportsActor:
-    """### Build the actor against the sample source configuration."""
-    return CommerceReportsActor(
-        api_url=REPORTS_API_URL,
-        api_key="TEST_KEY",
-        article_host=REPORTS_HOST,
-        article_paths=REPORTS_ARTICLE_PATHS,
-        news_types=news_types,
-        page_size=page_size,
-        max_pages=max_pages,
-    )
-
-
-def build_fetcher(
-    pages: dict[str, bytes],
+    scraper: FakeScraper,
     *,
-    failures: dict[str, Exception] | None = None,
-    content_types: dict[str, str] | None = None,
-) -> StubFetcher:
-    """### Serve canned API payloads."""
-    return StubFetcher(
-        pages,
-        failures=failures or {},
-        content_type="application/vnd.api+json",
-        content_types=content_types,
+    known: set[str] | None = None,
+    incomplete: list[IncompleteReport] | None = None,
+    bootstrap: bool = False,
+    max_pages: int = 6,
+    max_details: int = 20,
+    max_incomplete_retries: int = 5,
+    min_words: int = 5,
+) -> CommerceReportsActor:
+    """### Build the actor with a fake scraper and identity source."""
+    return CommerceReportsActor(
+        listing_url=COMMERCE_LISTING_URL,
+        firecrawl=scraper,
+        known_identities=(lambda: set(known or ())) if known is not None else None,
+        incomplete_reports=(lambda: list(incomplete or ())) if incomplete is not None else None,
+        bootstrap=bootstrap,
+        max_pages=max_pages,
+        max_detail_scrapes=max_details,
+        max_incomplete_retries=max_incomplete_retries,
+        min_body_words=min_words,
     )
+
+
+def incomplete(
+    index: int,
+    *,
+    attempts: int = 1,
+    title: str | None = None,
+) -> IncompleteReport:
+    """### Build one persisted incomplete-report retry candidate."""
+    return IncompleteReport(
+        identity=identity(index),
+        url=f"{COMMERCE_DETAIL_PREFIX}2025/01/report-{index}",
+        title=title or f"Report {index}",
+        published_date_raw="January 2025",
+        published_month=1,
+        published_year=2025,
+        attempts=attempts,
+    )
+
+
+def fetcher(pages: dict[str, str], *, failures: dict[str, Exception] | None = None) -> StubFetcher:
+    """### Serve canned listing pages to the preflight."""
+    return StubFetcher({url: html.encode() for url, html in pages.items()}, failures=failures or {})
+
+
+# $ Listing parser$
+
+
+def test_parse_listing_extracts_rows_and_range() -> None:
+    """### Rows, attachments, and the source range are parsed from the table."""
+    page = parse_listing(page_zero(1, 2, pdf=True), page_url=PAGE0, page_number=0, **SCOPE)
+    assert page is not None
+    assert [entry.title for entry in page.entries] == ["Report 1", "Report 2"]
+    assert page.entries[0].url == f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    assert page.entries[0].published_month == 1 and page.entries[0].published_year == 2025
+    assert page.entries[0].resources[0].original_url.endswith("report-1.pdf")
+    assert (page.range_start, page.range_end, page.total_reports) == (1, 20, 112)
+
+
+def test_parse_listing_deduplicates_and_rejects_unrelated_links() -> None:
+    """### Repeated rows collapse and off-scope links are ignored."""
+    html = commerce_listing_html(
+        [row(1), row(1), ("January 2025", "External", "https://example.com/reports/x", [])],
+        start=1,
+        end=20,
+    )
+    page = parse_listing(html, page_url=PAGE0, page_number=0, **SCOPE)
+    assert page is not None
+    assert len(page.entries) == 1
+
+
+def test_parse_listing_without_the_table_is_an_extraction_failure() -> None:
+    """### A page without the table is a failure, never an empty page."""
+    html = commerce_listing_html([], with_table=False)
+    assert parse_listing(html, page_url=PAGE0, page_number=0, **SCOPE) is None
+
+
+def test_parse_detail_extracts_the_report() -> None:
+    """### Detail pages yield title, day-precision date, marked body, and attachments."""
+    html = commerce_detail_html(
+        "Sample Commerce report",
+        attachments=[("/sites/default/files/2025-01/a.pdf", "a.pdf", "application/pdf")],
+    )
+    report = parse_detail(html, url=f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1", min_body_words=5)
+
+    assert report.title == "Sample Commerce report"
+    assert str(report.published_at) == "2025-01-17"
+    assert report.published_precision == "day"
+    assert report.text is not None and report.text.startswith(TEXT_BEGIN_MARKER)
+    assert report.content_hash
+    assert [resource.original_url for resource in report.resources] == [
+        "https://www.commerce.gov/sites/default/files/2025-01/a.pdf"
+    ]
+
+
+def test_parse_detail_flags_heading_only_content() -> None:
+    """### A heading-only page raises but carries its metadata forward."""
+    html = commerce_detail_html("Heading only", paragraphs=("Heading only",))
+    with pytest.raises(InsufficientReportContent) as error:
+        parse_detail(html, url=f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1", min_body_words=30)
+    assert error.value.words == 2
+    assert error.value.report.title == "Heading only"
+    assert error.value.report.text is None
+
+
+def test_parse_detail_without_an_article_container_raises() -> None:
+    """### A page without the article container cannot be used."""
+    html = commerce_detail_html("No article", with_article=False)
+    with pytest.raises(CommerceExtractionError):
+        parse_detail(html, url=f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1", min_body_words=5)
+
+
+# $ Preflight$
+
+
+def test_no_new_reports_makes_zero_firecrawl_calls() -> None:
+    """### A successful no-change preflight never touches Firecrawl."""
+    scraper = FakeScraper({})
+    actor = build_actor(scraper, known={identity(i) for i in range(1, 21)})
+    result = actor.run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert scraper.calls == []
+    assert result.check_outcome == "no_change"
+    assert result.status == "success"
+    assert result.documents == []
+    assert result.pagination_complete is True
+
+
+def test_new_report_triggers_targeted_firecrawl_acquisition() -> None:
+    """### Only the new report and the next page are scraped."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.check_outcome == "new_data"
+    assert result.status == "success"
+    assert scraper.urls() == [PAGE1, detail_url]
+    assert len(result.documents) == 1
+    assert result.documents[0].source_url == detail_url
+    assert result.provider_credits_used == 2
+
+
+def test_preflight_blocked_is_check_failed_without_firecrawl() -> None:
+    """### A denied preflight is a failed check, not no-change and not a crawl."""
+    scraper = FakeScraper({})
+    blocked = AccessBlockedError("blocked", url=PAGE0, status_code=403, reason="cloudflare")
+    result = build_actor(scraper, known=set()).run(fetcher({}, failures={PAGE0: blocked}))
+
+    assert result.check_outcome == "check_failed"
+    assert result.status == "failed"
+    assert scraper.calls == []
+    assert any("change detection fetch failed" in error for error in result.errors)
+
+
+def test_preflight_without_a_table_is_check_failed() -> None:
+    """### HTTP 200 without the listing table is a failed check."""
+    scraper = FakeScraper({})
+    html = commerce_listing_html([], with_table=False)
+    result = build_actor(scraper, known=set()).run(fetcher({PAGE0: html}))
+
+    assert result.check_outcome == "check_failed"
+    assert scraper.calls == []
+
+
+def test_preflight_without_a_baseline_is_check_failed() -> None:
+    """### Change detection requires persisted identities."""
+    scraper = FakeScraper({})
+    result = build_actor(scraper, known=None).run(fetcher({PAGE0: page_zero()}))
+
+    assert result.check_outcome == "check_failed"
+    assert scraper.calls == []
+    assert any("requires" in error for error in result.errors)
+
+
+# $ Pagination$
+
+
+def test_pagination_stops_at_the_overlap_boundary() -> None:
+    """### Pagination ends on the first page with no new identities."""
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+        }
+    )
+    known = {identity(i) for i in range(2, 41)}
+    result = build_actor(scraper, known=known, max_details=0).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.check_outcome == "new_data"
+    assert scraper.urls() == [PAGE1]
+    assert result.pagination_complete is True
+    assert result.listing_pages_attempted == 1
+
+
+def test_new_reports_spanning_pages_are_collected() -> None:
+    """### Discovery continues while pages still contain new reports."""
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            build_page_url(COMMERCE_LISTING_URL, 2): listing_page(range(41, 61), start=41, end=60, total=112),
+        }
+    )
+    known = {identity(i) for i in range(1, 61)} - {identity(1), identity(21)}
+    result = build_actor(scraper, known=known, max_details=0).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.check_outcome == "new_data"
+    assert result.articles_discovered == 2
+    assert result.documents_pending == 2
+    assert scraper.urls() == [PAGE1, build_page_url(COMMERCE_LISTING_URL, 2)]
+    assert result.pagination_complete is True
+
+
+def test_missing_table_on_a_firecrawl_page_stops_pagination() -> None:
+    """### A table-less page is an extraction failure, not the end of data."""
+    scraper = FakeScraper({PAGE1: commerce_listing_html([], with_table=False)})
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert result.listing_pages_failed == 1
+    assert any("did not contain the report table" in error for error in result.errors)
+
+
+def test_target_403_on_a_listing_page_is_not_end_of_pagination() -> None:
+    """### A denied listing page stops the crawl as a failure."""
+    scraper = FakeScraper({PAGE1: ""}, target_status=403)
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert any("returned HTTP 403" in error for error in result.errors)
+
+
+def test_range_gap_is_detected() -> None:
+    """### A gap between page ranges stops the crawl."""
+    scraper = FakeScraper({PAGE1: listing_page(range(30, 50), start=30, end=49, total=112)})
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert any("range gap" in error for error in result.errors)
+
+
+def test_changed_total_is_detected() -> None:
+    """### A different reported total between pages stops the crawl."""
+    scraper = FakeScraper({PAGE1: listing_page(range(21, 41), start=21, end=40, total=500)})
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert any("total changed" in error for error in result.errors)
+
+
+def test_range_row_mismatch_is_detected() -> None:
+    """### A range that does not match the row count stops the crawl."""
+    scraper = FakeScraper({PAGE1: listing_page(range(21, 41), start=21, end=99, total=112)})
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert any("does not match" in error for error in result.errors)
+
+
+def test_max_page_budget_is_enforced() -> None:
+    """### The page budget bounds Firecrawl listing calls."""
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            PAGE0.replace("page=0", "page=2"): listing_page(range(41, 61), start=41, end=60, total=112),
+        }
+    )
+    known = {identity(i) for i in range(1, 21)} - {identity(1)}
+    result = build_actor(scraper, known=known, max_pages=2, max_details=0).run(
+        fetcher({PAGE0: page_zero(*range(1, 21))})
+    )
+
+    assert result.pagination_complete is False
+    assert result.listing_pages_attempted == 1
+    assert any("firecrawl_max_pages_per_run" in error for error in result.errors)
+
+
+# $ Detail acquisition$
+
+
+def test_only_new_reports_receive_detail_scrapes() -> None:
+    """### Known reports never trigger a detail request."""
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            f"{COMMERCE_DETAIL_PREFIX}2025/01/report-2": commerce_detail_html("Report 2", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(2)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    detail_calls = [url for url in scraper.urls() if url.startswith(COMMERCE_DETAIL_PREFIX)]
+    assert detail_calls == [f"{COMMERCE_DETAIL_PREFIX}2025/01/report-2"]
+    assert len(result.documents) == 1
+
+
+def test_heading_only_detail_is_stored_as_an_incomplete_record() -> None:
+    """### A heading-only page keeps metadata and attachments but no body."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Heading only",)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    result = build_actor(scraper, known=known, min_words=30).run(fetcher({PAGE0: page_zero(*range(1, 21), pdf=True)}))
+
+    document = result.documents[0]
+    assert document.text is None
+    assert document.title == "Report 1"
+    assert str(document.published_at) == "2025-01-17"
+    assert result.records_without_text == 1
+    assert result.records_missing_required_fields == 1
+    assert document.resources and document.resources[0].url.endswith("report-1.pdf")
+
+
+def test_failed_detail_scrape_preserves_discovery_metadata() -> None:
+    """### A provider failure still yields a metadata-only record."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            detail_url: FirecrawlError("boom", url=detail_url),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert len(result.documents) == 1
+    assert result.documents[0].text is None
+    assert result.documents[0].source_url == detail_url
+    assert any("firecrawl detail failed" in error for error in result.errors)
+
+
+def test_detail_budget_leaves_pending_work() -> None:
+    """### The detail budget is enforced and remaining work is recorded."""
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1": commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+            f"{COMMERCE_DETAIL_PREFIX}2025/01/report-2": commerce_detail_html("Report 2", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1), identity(2)}
+    result = build_actor(scraper, known=known, max_details=1).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert len(result.documents) == 1
+    assert result.documents_pending == 1
+    assert any("detail scrape budget reached" in error for error in result.errors)
+
+
+def test_multiple_attachments_are_retained_and_deduplicated() -> None:
+    """### Every attachment stays with its report, repeated links collapse."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    html = commerce_detail_html(
+        "Report 1",
+        paragraphs=("Body " * 40,),
+        attachments=[
+            ("/sites/default/files/2025-01/a.pdf", "a.pdf", "application/pdf"),
+            ("/sites/default/files/2025-01/b.pdf", "b.pdf", "application/pdf"),
+            ("/sites/default/files/2025-01/a.pdf", "a.pdf", "application/pdf"),
+        ],
+    )
+    scraper = FakeScraper({PAGE1: listing_page([], start=21, end=20, total=112), detail_url: html})
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    urls = {resource.url for resource in result.documents[0].resources}
+    assert len(urls) == 2
+    assert any(url and url.endswith("a.pdf") for url in urls)
+    assert (
+        len([resource for resource in result.documents[0].resources if resource.url and resource.url.endswith("a.pdf")])
+        == 1
+    )
+
+
+def test_blocked_pdf_does_not_invalidate_the_report() -> None:
+    """### A denied attachment is recorded without losing the report body."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    pdf = "https://www.commerce.gov/sites/default/files/2025-01/report-1.pdf"
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page([], start=21, end=20, total=112),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    blocked = AccessBlockedError("blocked", url=pdf, status_code=403, reason="cloudflare")
+    result = build_actor(scraper, known=known).run(
+        fetcher({PAGE0: page_zero(*range(1, 21), pdf=True)}, failures={pdf: blocked})
+    )
+
+    document = result.documents[0]
+    assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
+    assert document.resources[0].status == "access_blocked"
+    assert result.resources_failed == 1
+
+
+def test_report_without_attachments_is_valid() -> None:
+    """### A report with no File(s) still produces a document."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    listing = commerce_listing_html(
+        [("January 2025", "Report 1", "/data-and-reports/reports/2025/01/report-1", [])], start=1, end=1
+    )
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page([], start=21, end=20, total=112),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(2, 41)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: listing}))
+
+    assert len(result.documents) == 1
+    assert result.documents[0].resources == ()
+
+
+# $ Bootstrap$
+
+
+def test_bootstrap_skips_the_preflight_and_uses_firecrawl() -> None:
+    """### Bootstrap acquisition never depends on a successful preflight."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper(
+        {
+            PAGE0: listing_page([1], start=1, end=1, total=1),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+        }
+    )
+    result = build_actor(scraper, known=set(), bootstrap=True).run(fetcher({}))
+
+    assert result.check_outcome == "new_data"
+    assert scraper.urls() == [PAGE0, detail_url]
+    assert len(result.documents) == 1
+    assert result.status == "success"
+
+
+def test_bootstrap_without_a_firecrawl_client_fails_clearly() -> None:
+    """### The actor refuses to run without an acquisition client."""
+    actor = CommerceReportsActor(
+        listing_url=COMMERCE_LISTING_URL,
+        firecrawl=None,
+        known_identities=lambda: set(),
+        bootstrap=True,
+    )
+    result = actor.run(fetcher({}))
+    assert result.check_outcome == "check_failed"
+    assert any("firecrawl is not configured" in error for error in result.errors)
+
+
+# $ Discovery consistency$
+
+
+def test_repeated_listing_page_is_detected_as_overlap() -> None:
+    """### A page repeating an earlier page is an inconsistency, not an overlap boundary."""
+    scraper = FakeScraper({PAGE1: listing_page(range(1, 21), start=1, end=20, total=112)})
+    known = {identity(i) for i in range(2, 41)}
+    result = build_actor(scraper, known=known, max_details=0).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert any("repeated" in error and "earlier page" in error for error in result.errors)
+    assert result.articles_discovered == 1
+
+
+def test_expected_reports_missing_from_an_inconsistent_page_are_reported() -> None:
+    """### Expected new identities are flagged when page 0 cannot confirm them."""
+    html = commerce_listing_html([row(1), row(2)], start=1, end=20, total=112)
+    scraper = FakeScraper({})
+    result = build_actor(scraper, known=set(), max_details=0).run(fetcher({PAGE0: html}))
+
+    assert result.check_outcome == "new_data"
+    assert result.pagination_complete is False
+    assert result.articles_discovered == 0
+    assert any("were not found while paginating" in error for error in result.errors)
+    assert scraper.calls == []
+
+
+def test_articles_discovered_is_recorded_when_pagination_aborts() -> None:
+    """### The discovered count survives an early listing extraction failure."""
+    scraper = FakeScraper({PAGE1: commerce_listing_html([], with_table=False)})
+    known = {identity(i) for i in range(4, 41)}
+    result = build_actor(scraper, known=known).run(fetcher({PAGE0: page_zero(*range(1, 21))}))
+
+    assert result.pagination_complete is False
+    assert result.articles_discovered == 3
+
+
+# $ Incomplete-report retry$
+
+
+def test_no_change_run_retries_only_incomplete_reports() -> None:
+    """### A no-change run retries stored incomplete reports without listing credits."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper({detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,))})
+    known = {identity(i) for i in range(1, 21)}
+    result = build_actor(scraper, known=known, incomplete=[incomplete(1)]).run(
+        fetcher({PAGE0: page_zero(*range(1, 21))})
+    )
+
+    assert result.check_outcome == "no_change"
+    assert result.status == "success"
+    assert scraper.urls() == [detail_url]
+    assert len(result.documents) == 1
+    assert result.documents[0].text is not None
+
+
+def test_incomplete_retries_are_bounded_per_run() -> None:
+    """### The per-run retry cap limits how many incomplete reports are re-scraped."""
+    first = incomplete(1)
+    second = incomplete(2)
+    scraper = FakeScraper(
+        {
+            first.url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+            second.url: commerce_detail_html("Report 2", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 21)}
+    result = build_actor(scraper, known=known, incomplete=[first, second], max_incomplete_retries=1).run(
+        fetcher({PAGE0: page_zero(*range(1, 21))})
+    )
+
+    assert scraper.urls() == [first.url]
+    assert len(result.documents) == 1
+
+
+def test_failed_check_defers_incomplete_retries_without_firecrawl() -> None:
+    """### A blocked preflight never launches Firecrawl, even for pending retries."""
+    scraper = FakeScraper({})
+    blocked = AccessBlockedError("blocked", url=PAGE0, status_code=403, reason="cloudflare")
+    result = build_actor(scraper, known=set(), incomplete=[incomplete(1)]).run(fetcher({}, failures={PAGE0: blocked}))
+
+    assert result.check_outcome == "check_failed"
+    assert scraper.calls == []
+    assert result.documents_pending == 1
+
+
+def test_failed_incomplete_retry_preserves_stored_metadata() -> None:
+    """### A retry that fails again keeps the stored title and report identity."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    scraper = FakeScraper({detail_url: FirecrawlError("still blocked", url=detail_url)})
+    known = {identity(i) for i in range(1, 21)}
+    result = build_actor(scraper, known=known, incomplete=[incomplete(1, title="Stored title")]).run(
+        fetcher({PAGE0: page_zero(*range(1, 21))})
+    )
+
+    assert len(result.documents) == 1
+    assert result.documents[0].text is None
+    assert result.documents[0].source_url == detail_url
+    assert result.documents[0].title == "Stored title"
+
+
+# $ PDF reuse$
 
 
 def build_pdf(text: str) -> bytes:
-    """### Create a small synthetic PDF for offline attachment tests."""
+    """### Build a real in-memory PDF for the resource-extraction test."""
+    import pymupdf
+
     document = pymupdf.open()
     page = document.new_page()
     page.insert_text((72, 72), text)
@@ -76,354 +687,28 @@ def build_pdf(text: str) -> bytes:
     return payload
 
 
-def test_actor_maps_a_report_into_the_contract() -> None:
-    """### A report maps observed API text, identity, date and provenance into canonical output."""
-    record = commerce_record()
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
+def test_discovered_pdf_runs_through_extraction_with_marker() -> None:
+    """### A discovered PDF reuses the existing extraction flow and keeps TEXT-BEGIN."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    pdf = "https://www.commerce.gov/sites/default/files/2025-01/report-1.pdf"
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page(range(21, 41), start=21, end=40, total=112),
+            detail_url: commerce_detail_html("Report 1", paragraphs=("Body " * 40,)),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    source = StubFetcher(
+        {PAGE0: page_zero(*range(1, 21), pdf=True).encode("utf-8"), pdf: build_pdf("Attachment body text")},
+        content_types={pdf: "application/pdf"},
+    )
+    result = build_actor(scraper, known=known).run(source)
 
     assert result.status == "success"
-    assert result.listing_pages_succeeded == 1
-    assert result.articles_discovered == 1
-    assert len(result.documents) == 1
-
     document = result.documents[0]
-    assert document.source == "commerce_reports"
-    assert document.source_url == record["href"]
-    assert document.title == record["label"]
-    assert document.language == "en"
     assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
-    assert document.content_hash
-    assert document.native_id == str(record["id"])
-    assert document.identity_key == f"commerce_reports:id:{record['id']}"
-    assert document.published_at.isoformat() == "2026-01-15"
-    assert document.source_created_at is not None
-    assert document.source_created_at.year == 2026
-    assert document.published_month is None and document.published_year == 2026
-    assert document.published_precision == "day"
-    assert document.summary == "A short teaser."
-    assert document.provenance == "live"
-    assert document.archive_url is None
-
-
-def test_api_mapping_normalizes_nested_html_and_uses_teaser_precedence() -> None:
-    """### API text is readable, scripts are omitted, and created is not publication date."""
-    record = commerce_record(
-        body="<div><ul><li><p>First &amp; clear.</p></li><li><p>Second point.</p></li></ul>"
-        "<script>tracking()</script><style>.hidden{display:none}</style></div>",
-        teaser="<p>Teaser &amp; details.</p>",
-        subtitle="Subtitle fallback",
-        created=1,
-        post_date="2024-05-06",
-    )
-    report = from_api_payload(record)
-    assert report.text == "TEXT-BEGIN\nFirst & clear.\n\nSecond point."
-    assert "tracking" not in (report.text or "")
-    assert report.summary == "Teaser & details."
-    assert report.published_at.isoformat() == "2024-05-06"
-    assert report.api_created_at is not None and report.api_created_at.year == 1970
-
-
-def test_api_mapping_supports_month_year_and_keeps_unknown_date_raw() -> None:
-    """### Publication precision is retained without assigning a missing day."""
-    report = from_api_payload(commerce_record(post_date=None, post_date_formatted="January 2024"))
-    assert report.published_at is None
-    assert (report.published_month, report.published_year, report.published_precision) == (1, 2024, "month")
-    unknown = from_api_payload(commerce_record(post_date="the other day", post_date_formatted=None))
-    assert unknown.published_date_raw == "the other day"
-    assert unknown.published_precision is None
-
-
-def test_api_mapping_uses_subtitle_when_teaser_is_empty() -> None:
-    """### Subtitle supplies the canonical summary when teaser is absent."""
-    report = from_api_payload(commerce_record(teaser="  ", subtitle="<p>Secondary summary.</p>"))
-    assert report.summary == "Secondary summary."
-    assert from_api_payload(commerce_record(teaser=None, subtitle=None)).summary is None
-
-
-def test_api_mapping_resolves_explicit_relative_attachment_urls() -> None:
-    """### A real relative download URL is resolved without constructing a URL from a title."""
-    record = commerce_record(documents=[{"id": "file-9", "title": "attachment.pdf", "url": "/files/attachment.pdf"}])
-    report = from_api_payload(record)
-    assert report.resources[0].native_id == "file-9"
-    assert report.resources[0].original_url == f"https://{REPORTS_HOST}/files/attachment.pdf"
-
-
-def test_actor_preserves_attachment_metadata_without_fabricating_urls() -> None:
-    """### Attachments without an API URL keep their metadata and are marked unavailable."""
-    record = commerce_record(
-        record_id="208",
-        documents=[
-            {
-                "id": "1854",
-                "title": "report.pdf",
-                "filemime": "application/pdf",
-                "filesize": "1646999",
-                "href": {},
-            }
-        ],
-    )
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
-    document = result.documents[0]
-
-    assert len(document.resources) == 1
     resource = document.resources[0]
-    assert resource.native_id == "1854"
-    assert resource.parent_identity == document.identity_key
-    assert resource.url is None
-    assert resource.kind == "pdf"
-    assert resource.mime_type == "application/pdf"
-    assert resource.file_size == 1_646_999
-    assert resource.status == "url_unavailable"
-    assert resource.text is None
-    assert result.status == "partial_failure"
-    assert (result.resources_discovered, result.resources_processed, result.resources_unavailable) == (1, 1, 1)
-
-
-def test_actor_extracts_declared_pdf_urls_independently_of_report_text() -> None:
-    """### Linked PDFs are extracted onto their own resources and non-PDF files are skipped."""
-    first_url = f"https://{REPORTS_HOST}/files/first.pdf"
-    missing_url = f"https://{REPORTS_HOST}/files/missing.pdf"
-    sheet_url = f"https://{REPORTS_HOST}/files/table.xlsx"
-    record = commerce_record(
-        documents=[
-            {"title": "first.pdf", "filemime": "application/pdf", "url": first_url},
-            {"title": "missing.pdf", "filemime": "application/pdf", "url": missing_url},
-            {
-                "title": "table.xlsx",
-                "filemime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "url": sheet_url,
-            },
-        ]
-    )
-    fetcher = build_fetcher(
-        {FIRST_PAGE_URL: commerce_page([record]), first_url: build_pdf("Attachment text")},
-        failures={missing_url: FetchError("not found", url=missing_url, status_code=404)},
-        content_types={first_url: "application/pdf"},
-    )
-
-    result = build_actor().run(fetcher)
-    document = result.documents[0]
-
-    assert document.text is not None and "First report paragraph" in document.text
-    first, missing, sheet = document.resources
-    assert first.status == "complete" and first.text and "Attachment text" in first.text
-    assert first.text != document.text and first.page_count == 1
-    assert missing.status == "url_unavailable" and missing.text is None
-    assert sheet.status == "not_applicable" and sheet.url == sheet_url
-    assert sheet_url not in fetcher.calls
-    assert result.status == "partial_failure"
-    assert (result.resources_discovered, result.resources_processed) == (3, 3)
-    assert (result.resources_extracted, result.resources_unavailable, result.resources_skipped) == (1, 1, 1)
-
-
-def test_actor_maps_the_lowercase_image_field() -> None:
-    """### The API image field is lowercase and reaches the canonical document."""
-    record = commerce_record(
-        image={"ImageElements": [{"ImageUrl": "https://www.commerce.gov/sites/default/files/img.png"}]}
-    )
-    document = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])})).documents[0]
-    assert document.image_url == "https://www.commerce.gov/sites/default/files/img.png"
-
-
-def test_actor_filters_out_other_news_types() -> None:
-    """### Non-report records are counted and dropped."""
-    records = [
-        commerce_record(),
-        commerce_record(record_id="2", news_types=("Fact sheets",), href=report_url("fact", kind="news")),
-    ]
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page(records)}))
-
-    assert result.articles_discovered == 1
-    assert result.records_filtered_out == 1
-
-
-def test_actor_paginates_by_explicit_offsets() -> None:
-    """### Pages are requested by offset on the configured API host."""
-    first = commerce_page(
-        [
-            commerce_record(),
-            commerce_record(record_id="2", href=report_url("second")),
-        ]
-    )
-    second = commerce_page([commerce_record(record_id="3", href=report_url("third"))])
-    offset_two = page_url(2, 2)
-    fetcher = build_fetcher({page_url(2, 0): first, offset_two: second})
-    result = build_actor(page_size=2).run(fetcher)
-
-    assert result.listing_pages_attempted == 2
-    assert result.articles_discovered == 3
-    assert result.pagination_complete is True
-    assert fetcher.call_count(offset_two) == 1
-    assert all(url.startswith(REPORTS_API_URL) for url in fetcher.calls)
-
-
-def test_actor_stops_when_offset_pagination_repeats_a_page() -> None:
-    """### Repeated API responses cannot keep pagination moving over duplicate data."""
-    record = commerce_record()
-    repeated = commerce_page([record])
-    fetcher = build_fetcher({page_url(1, 0): repeated, page_url(1, 1): repeated})
-    result = build_actor(page_size=1, max_pages=3).run(fetcher)
-    assert result.articles_discovered == 1
-    assert any("repeated a page" in message for message in result.errors)
-    assert result.pagination_complete is False
-
-
-def test_malformed_record_does_not_discard_earlier_documents() -> None:
-    """### A timestamp conversion error is isolated to its own API record."""
-    valid = commerce_record()
-    malformed = commerce_record(record_id="2", href=report_url("broken"), created=10**100)
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([valid, malformed])}))
-    assert len(result.documents) == 2
-    assert result.documents[0].text is not None
-    assert result.documents[1].text is None
-    assert result.detail_pages_succeeded == 1
-    assert result.detail_pages_failed == 1
-    assert result.status == "partial_failure"
-
-
-def test_actor_phase_exception_keeps_already_accumulated_documents(monkeypatch: pytest.MonkeyPatch) -> None:
-    """### A late actor-level failure returns the current result instead of replacing it."""
-    actor = build_actor()
-
-    def append_then_fail(fetcher: Any, state: Any, result: Any) -> None:
-        result.documents.append(
-            CanonicalDocument(
-                source="commerce_reports",
-                source_url=report_url("kept"),
-                title="Already collected",
-                language="en",
-            )
-        )
-        raise RuntimeError("unexpected conversion error")
-
-    monkeypatch.setattr(actor, "_materialize", append_then_fail)
-    result = actor.run(build_fetcher({FIRST_PAGE_URL: commerce_page([commerce_record()])}))
-    assert len(result.documents) == 1
-    assert result.documents[0].title == "Already collected"
-    assert any("unexpected actor phase failure" in error for error in result.errors)
-
-
-def test_actor_ignores_a_foreign_pagination_link() -> None:
-    """### A next link on another host is never followed."""
-    first = commerce_page([commerce_record()], next_page="https://www.commerce.gov/api/news?page[offset]=50")
-    result = build_actor(page_size=1, max_pages=1).run(build_fetcher({page_url(1, 0): first}))
-
-    assert result.articles_discovered == 1
-    assert any("max_pages" in message for message in result.errors)
-    assert result.pagination_complete is False
-
-
-def test_actor_stops_at_the_page_bound() -> None:
-    """### The page bound is honoured and reported as incomplete pagination."""
-    record = commerce_record()
-    result = build_actor(page_size=1, max_pages=1).run(build_fetcher({page_url(1, 0): commerce_page([record])}))
-
-    assert result.listing_pages_attempted == 1
-    assert result.pagination_complete is False
-    assert any("max_pages" in message for message in result.errors)
-
-
-def test_actor_deduplicates_reports_by_url() -> None:
-    """### The same report on two pages yields one document."""
-    record = commerce_record()
-    first = commerce_page([record])
-    second = commerce_page([record])
-    fetcher = build_fetcher({page_url(1, 0): first, page_url(1, 1): second})
-    result = build_actor(page_size=1, max_pages=2).run(fetcher)
-
-    assert len(result.documents) == 1
-    assert result.article_urls_deduplicated == 0
-    assert any("repeated a page" in message for message in result.errors)
-
-
-def test_actor_keeps_reports_without_body_as_metadata() -> None:
-    """### A report with no body is stored without pretending it has text."""
-    record = commerce_record(body=None, teaser=None, subtitle=None)
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
-
-    assert len(result.documents) == 1
-    document = result.documents[0]
-    assert document.text is None
-    assert document.content_hash is None
-    assert result.records_without_text == 1
-    assert result.detail_pages_failed == 1
-
-
-def test_actor_reports_a_blocked_api() -> None:
-    """### An access denial fails the run with the reason recorded."""
-    blocked = AccessBlockedError("source refused the request", url=FIRST_PAGE_URL, status_code=403, reason="blocked")
-    result = build_actor().run(build_fetcher({}, failures={FIRST_PAGE_URL: blocked}))
-
-    assert result.status == "failed"
-    assert result.listing_pages_failed == 1
-    assert result.documents == []
-    assert any("api fetch failed" in message for message in result.errors)
-
-
-def test_actor_reports_malformed_json() -> None:
-    """### A non-JSON body is a parse failure, never an empty dataset."""
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: b"<html>not json</html>"}))
-
-    assert result.status == "failed"
-    assert any("api parse failed" in message for message in result.errors)
-
-
-def test_actor_fails_when_no_report_matches() -> None:
-    """### No matching records is a failure, not a successful empty crawl."""
-    record = commerce_record(news_types=("Blog",))
-    result = build_actor().run(build_fetcher({FIRST_PAGE_URL: commerce_page([record])}))
-
-    assert result.status == "failed"
-    assert result.documents == []
-    assert any("no report records matched" in message for message in result.errors)
-
-
-def test_actor_requires_the_http_engine() -> None:
-    """### The API source cannot be served by the rendering engine."""
-    assert CommerceReportsActor.requires_http_engine is True
-
-
-def test_page_url_helpers() -> None:
-    """### Page URLs carry both the key and an explicit offset."""
-    assert f"{REPORTS_API_URL}?page%5Blimit%5D=50&page%5Boffset%5D=0&api_key=TEST_KEY" == FIRST_PAGE_URL
-    assert with_api_key(f"{REPORTS_API_URL}?api_key=OLD&page%5Boffset%5D=50", "NEW").endswith("api_key=NEW")
-    assert "api_key=OLD" not in with_api_key(f"{REPORTS_API_URL}?api_key=OLD&x=1", "NEW")
-
-
-def test_parse_api_page_rejects_bad_payloads() -> None:
-    """### Malformed envelopes are reported, never silently empty."""
-    with pytest.raises(CommerceApiError, match="not JSON"):
-        parse_api_page(b"nope", page_url=FIRST_PAGE_URL, **SCOPE)
-    with pytest.raises(CommerceApiError, match="not a JSON object"):
-        parse_api_page(b"[]", page_url=FIRST_PAGE_URL, **SCOPE)
-    with pytest.raises(CommerceApiError, match="no 'data' array"):
-        parse_api_page(b'{"jsonapi": {}}', page_url=FIRST_PAGE_URL, **SCOPE)
-
-
-def test_parse_api_page_skips_unusable_records() -> None:
-    """### Records without identity or outside the scope are skipped and counted."""
-    payload = commerce_page(
-        [
-            commerce_record(),
-            commerce_record(record_id="2", href="https://example.com/reports/nope"),
-            commerce_record(record_id="3", href="https://www.commerce.gov/about/not-a-report"),
-            {"id": "4"},
-        ]
-    )
-    page = parse_api_page(payload, page_url=FIRST_PAGE_URL, **SCOPE)
-    assert len(page.records) == 1
-    assert page.skipped_records == 3
-
-
-def test_report_url_scope_is_enforced() -> None:
-    """### Only in-scope Commerce report URLs are accepted."""
-    assert is_report_url(f"https://{REPORTS_HOST}/reports/2026/01/example", **SCOPE)
-    assert not is_report_url("https://example.com/reports/x", **SCOPE)
-    assert not is_report_url(f"https://{REPORTS_HOST}/about/history", **SCOPE)
-
-
-def test_news_type_filter_labels() -> None:
-    """### The news type filter reads the API's label list."""
-    assert is_news_release(commerce_record(), ("Reports",)) is True
-    assert is_news_release(commerce_record(news_types=("Blog",)), ("Reports",)) is False
-    assert is_news_release(commerce_record(news_types=("Blog",)), ()) is True
+    assert resource.status == "complete"
+    assert resource.text is not None and resource.text.startswith(TEXT_BEGIN_MARKER)
+    assert resource.content_hash == compute_content_hash(resource.text)
+    assert result.resources_extracted == 1

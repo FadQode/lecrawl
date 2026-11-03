@@ -57,7 +57,10 @@ _COUNTER_COLUMNS = (
     "resources_skipped",
     "documents_processed",
     "documents_failed",
+    "documents_pending",
+    "provider_credits_used",
 )
+CHECK_OUTCOME_VALUES = ("no_change", "new_data", "check_failed")
 _COUNTERS_NON_NEGATIVE = " AND ".join(f"{column} >= 0" for column in _COUNTER_COLUMNS)
 
 
@@ -95,6 +98,9 @@ class CrawlRunSource(Base):
     __table_args__ = (
         UniqueConstraint("crawl_run_id", "source_id"),
         CheckConstraint(f"status {sql_in(get_args(RunStatus))}", name="status_values"),
+        CheckConstraint(
+            f"check_outcome IS NULL OR check_outcome {sql_in(CHECK_OUTCOME_VALUES)}", name="check_outcome_values"
+        ),
         CheckConstraint(_COUNTERS_NON_NEGATIVE, name="counters_non_negative"),
         CheckConstraint(timestamp_order("started_at", "finished_at"), name="finished_after_started"),
         Index("ix_crawl_run_sources_source_id_started_at", "source_id", text("started_at DESC")),
@@ -126,6 +132,9 @@ class CrawlRunSource(Base):
     resources_skipped: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     documents_processed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     documents_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    documents_pending: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    provider_credits_used: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    check_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pagination_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -90,6 +90,7 @@ def persist_source_result(
         error_summary=redact_secrets(error_summary(result) or ""),
         started_at=timestamp - timedelta(seconds=max(0.0, result.duration_seconds)),
         finished_at=timestamp,
+        check_outcome=result.check_outcome,
     )
 
     errors: list[AttributedError] = [AttributedError(payload=payload) for payload in run_error_payloads(result)]
@@ -185,6 +186,7 @@ def persist_failed_source(
         error_summary=message,
         started_at=timestamp,
         finished_at=timestamp,
+        check_outcome=result.check_outcome,
     )
     replace_errors(
         session,

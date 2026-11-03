@@ -30,7 +30,7 @@ from lexcrawl.persistence import (
     redact_secrets,
 )
 from lexcrawl.repositories.crawl_runs import create_run
-from lexcrawl.repositories.documents import upsert_document
+from lexcrawl.repositories.documents import incomplete_reports, upsert_document
 from lexcrawl.repositories.localizations import upsert_localization
 from lexcrawl.repositories.mapping import localization_payloads
 from lexcrawl.repositories.resources import upsert_resource
@@ -467,3 +467,88 @@ def test_redact_secrets_removes_credentials_and_keys() -> None:
     assert "ABC123" not in redacted
     assert "T1" not in redacted
     assert "api_key=***" in redacted
+
+
+def test_no_change_run_is_persisted_as_success(session_factory: sessionmaker[Session]) -> None:
+    """### A verified no-change run is stored as successful with zero documents."""
+    report = CrawlRunReport(results=[result(source="commerce_reports", check_outcome="no_change")])
+    persisted = persist_crawl_report(session_factory, report)
+
+    assert persisted.status == "success"
+    with session_factory() as session:
+        run_source = session.execute(select(CrawlRunSource)).scalar_one()
+        assert run_source.status == "success"
+        assert run_source.check_outcome == "no_change"
+        assert run_source.documents_processed == 0
+        assert run_source.pagination_complete is True
+
+
+def test_budget_accounting_is_persisted(session_factory: sessionmaker[Session]) -> None:
+    """### Pending reports and provider credits survive persistence."""
+    canonical = document(source="commerce_reports", url=f"{SITE}/reports/2026/01/one", published_at=None)
+    report = CrawlRunReport(
+        results=[
+            result(
+                source="commerce_reports",
+                documents=(canonical,),
+                check_outcome="new_data",
+                documents_pending=4,
+                provider_credits_used=7,
+                detail_pages_attempted=5,
+                detail_pages_succeeded=1,
+            )
+        ]
+    )
+    persist_crawl_report(session_factory, report)
+
+    with session_factory() as session:
+        run_source = session.execute(select(CrawlRunSource)).scalar_one()
+        assert run_source.check_outcome == "new_data"
+        assert run_source.documents_pending == 4
+        assert run_source.provider_credits_used == 7
+        assert run_source.documents_processed == 1
+
+
+def test_incomplete_attempts_accumulate_then_reset(db_session: Session) -> None:
+    """### Incomplete documents count attempts; completing resets the counter."""
+    source = source_id(db_session, "commerce_reports")
+    pending = document(
+        source="commerce_reports", url=f"{SITE}/reports/one", text=None, status="failed", published_at=None
+    )
+    document_id = upsert_document(db_session, source_id=source, document=pending, now=timestamp())
+    db_session.flush()
+    assert db_session.get(Document, document_id).extraction_attempts == 1
+
+    upsert_document(db_session, source_id=source, document=pending, now=timestamp())
+    db_session.flush()
+    assert db_session.get(Document, document_id).extraction_attempts == 2
+
+    completed = document(
+        source="commerce_reports", url=f"{SITE}/reports/one", text="report body", status="complete", published_at=None
+    )
+    upsert_document(db_session, source_id=source, document=completed, now=timestamp())
+    db_session.flush()
+    assert db_session.get(Document, document_id).extraction_attempts == 0
+
+
+def test_incomplete_reports_query_selects_only_retry_candidates(db_session: Session) -> None:
+    """### Only incomplete reports below the attempt budget are retried."""
+    source = source_id(db_session, "commerce_reports")
+    pending = document(
+        source="commerce_reports", url=f"{SITE}/reports/pending", text=None, status="failed", published_at=None
+    )
+    document_id = upsert_document(db_session, source_id=source, document=pending, now=timestamp())
+    for payload in localization_payloads(pending):
+        upsert_localization(db_session, document_id=document_id, payload=payload, now=timestamp())
+    done = document(
+        source="commerce_reports", url=f"{SITE}/reports/done", text="body", status="complete", published_at=None
+    )
+    upsert_document(db_session, source_id=source, document=done, now=timestamp())
+    db_session.flush()
+
+    candidates = incomplete_reports(db_session, source_code="commerce_reports", max_attempts=3)
+    assert [candidate.url for candidate in candidates] == [f"{SITE}/reports/pending"]
+    assert candidates[0].identity == pending.identity_key
+    assert candidates[0].title == pending.title
+    assert candidates[0].attempts == 1
+    assert incomplete_reports(db_session, source_code="commerce_reports", max_attempts=1) == []

@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     listings_secondary_url: str = ""
     crawl_bilingual: bool = False
 
+    reports_listing_url: str = ""
     reports_api_url: str = ""
     reports_api_key: str = ""
     reports_article_host: str = ""
@@ -63,6 +64,20 @@ class Settings(BaseSettings):
     reports_news_types: str = ""
     reports_page_size: int = Field(default=50, ge=1, le=200)
     reports_max_pages: int = Field(default=4, ge=1)
+
+    # $ Firecrawl is budget-limited, so every limit is explicit and validated.$
+    firecrawl_api_url: str = "https://api.firecrawl.dev/v2/scrape"
+    firecrawl_api_key: str = ""
+    firecrawl_max_pages_per_run: int = Field(default=6, ge=1, le=50)
+    firecrawl_max_detail_scrapes_per_run: int = Field(default=20, ge=0, le=500)
+    firecrawl_request_delay_seconds: float = Field(default=1.5, ge=0, le=60)
+    firecrawl_max_retries: int = Field(default=2, ge=0, le=5)
+    firecrawl_timeout_seconds: float = Field(default=90.0, gt=0)
+    firecrawl_min_body_words: int = Field(default=30, ge=1)
+    firecrawl_cache_dir: str = "data/firecrawl-cache"
+    # $ Incomplete detail scrapes are retried a bounded number of times, then left alone.$
+    firecrawl_incomplete_max_attempts: int = Field(default=3, ge=1, le=20)
+    firecrawl_incomplete_retries_per_run: int = Field(default=5, ge=0, le=100)
 
     releases_api_url: str = ""
     releases_site_url: str = ""

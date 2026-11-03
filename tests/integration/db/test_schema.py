@@ -248,3 +248,42 @@ def test_restricted_source_deletion_is_refused(db_session: Session) -> None:
     with pytest.raises(IntegrityError):
         db_session.execute(delete(Source).where(Source.id == identifier))
     db_session.rollback()
+
+
+def test_invalid_check_outcome_is_rejected(db_session: Session) -> None:
+    """### Only the supported preflight outcomes are stored."""
+    run_id = insert_run(db_session)
+    with pytest.raises(IntegrityError):
+        db_session.execute(
+            insert(CrawlRunSource).values(
+                crawl_run_id=run_id,
+                source_id=source_id(db_session),
+                status="success",
+                check_outcome="unknown_outcome",
+                started_at=timestamp(),
+            )
+        )
+    db_session.rollback()
+
+
+def test_negative_extraction_attempts_are_rejected(db_session: Session) -> None:
+    """### The retry counter cannot go negative."""
+    with pytest.raises(IntegrityError):
+        insert_document(db_session, extraction_attempts=-1)
+    db_session.rollback()
+
+
+def test_negative_pending_count_is_rejected(db_session: Session) -> None:
+    """### Pending work cannot be negative."""
+    run_id = insert_run(db_session)
+    with pytest.raises(IntegrityError):
+        db_session.execute(
+            insert(CrawlRunSource).values(
+                crawl_run_id=run_id,
+                source_id=source_id(db_session),
+                status="success",
+                documents_pending=-1,
+                started_at=timestamp(),
+            )
+        )
+    db_session.rollback()

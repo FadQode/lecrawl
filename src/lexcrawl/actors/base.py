@@ -10,6 +10,7 @@ from lexcrawl.crawling.base import Fetcher
 from lexcrawl.models.document import CanonicalDocument
 
 RunStatus = Literal["success", "partial_failure", "failed"]
+CheckOutcome = Literal["no_change", "new_data", "check_failed"]
 
 
 @dataclass(slots=True)
@@ -40,12 +41,19 @@ class ActorRunResult:
     resources_unavailable: int = 0
     resources_failed: int = 0
     resources_skipped: int = 0
+    documents_pending: int = 0
+    provider_credits_used: int = 0
+    check_outcome: CheckOutcome | None = None
     pagination_complete: bool = False
     duration_seconds: float = 0.0
 
     @property
     def status(self) -> RunStatus:
-        """### Derive the run status from collected documents and errors."""
+        """### Derive the run status from the preflight outcome, documents, and errors."""
+        if self.check_outcome == "no_change":
+            return "success"
+        if self.check_outcome == "check_failed":
+            return "failed"
         if not self.documents:
             return "failed"
         if self.errors:

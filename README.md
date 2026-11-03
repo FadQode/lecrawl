@@ -165,21 +165,60 @@ with `text: null`. Existing sources are unaffected because the field defaults to
 
 ### U.S. Department of Commerce reports
 
-- Collection uses the documented public API configured in `REPORTS_API_URL`, so there is no
-  HTML scraping for this source. The API answers with a
-  JSON:API envelope (`data` records plus `links.next`), and pagination follows that next link
-  with the API key re-attached, bounded by `COMMERCE_MAX_PAGES`.
-- Records are filtered client-side by `COMMERCE_NEWS_TYPES` (default `Reports`) and
-  deduplicated by canonical URL; the count of dropped records is reported as `filtered`.
-- In-scope URLs are the paths listed in `REPORTS_ARTICLE_PATHS` on the host set by
-  `REPORTS_ARTICLE_HOST`; records outside them are skipped and counted.
-- Fields: `label` → title, `href`/`self` → canonical URL, `body` → paragraph text,
-  `teaser`/`subtitle` → summary, `news_type[].label` → the filter. Publication date prefers
-  `post_date`, then `post_date_formatted`, then `created`/`updated` (unix seconds); records
-  without any usable date are counted and reported, not dropped.
-- The default `COMMERCE_API_KEY=DEMO_KEY` is api.data.gov's public demo key, limited to
-  about 30 requests per hour and 50 per day per IP. Request a free key and set
-  `COMMERCE_API_KEY` for regular collection.
+Discovery is **budget-aware and incremental**, because Firecrawl credits are limited:
+
+1. **Cheap preflight (no Firecrawl).** The actor fetches the report listing over ordinary HTTP
+   through the existing `Fetcher`, parses page 0, and compares the newest identities with the
+   persisted `documents.identity_key` set. Outcomes are explicit: `no_change`,
+   `new_data`, or `check_failed`.
+2. `no_change` finishes the run with **zero Firecrawl calls** and is recorded as a *successful*
+   run (`check_outcome=no_change`), not a failure.
+3. `check_failed` (403/challenge, missing table, no baseline) also makes **zero** Firecrawl calls,
+   records the failure, and never triggers a historical crawl.
+4. Only `new_data` starts Firecrawl: listing pages are requested sequentially with explicit
+   `?q=<listing-path>&page=N` URLs, paced, bounded by `FIRECRAWL_MAX_PAGES_PER_RUN`, and stop at
+   the first page with no new identities (the overlap boundary) or at the source's reported range
+   end. Page 0 from the preflight is reused, so only later pages cost credits.
+5. Only **new** reports get a detail scrape, bounded by `FIRECRAWL_MAX_DETAIL_SCRAPES_PER_RUN`;
+   the remainder is reported as `documents_pending` for a later run. Detail responses are cached
+   under `FIRECRAWL_CACHE_DIR`, so a rerun does not pay again for an already acquired page.
+6. **Incomplete reports are retried under a persisted, bounded budget.** A failed or
+   metadata-only report is never silently treated as done: `documents.extraction_attempts`
+   counts each detail attempt (`FIRECRAWL_INCOMPLETE_MAX_ATTEMPTS`, default 3), and
+   `incomplete_reports` surfaces those below the budget so a run can retry them directly —
+   without a listing pass — capped by `FIRECRAWL_INCOMPLETE_RETRIES_PER_RUN` (default 5).
+   Completed reports reset the counter and are excluded. A no-change run with no retry
+   candidates still makes **zero** Firecrawl calls; a no-change run with candidates performs
+   **only** those detail retries.
+7. Discovery is **self-checking**: a provider page that repeats an earlier page's identities
+   (pagination not honoured) or a page whose range contradicts its row count is treated as an
+   inconsistency that stops the crawl as incomplete, not as an overlap boundary. Any preflight
+   identity that discovery cannot confirm is reported as a discrepancy, and
+   `articles_discovered` is recorded even when pagination aborts early.
+8. Detail pages must contain meaningful body content (`FIRECRAWL_MIN_BODY_WORDS`, default 30).
+   Heading-only pages keep their title, date, and attachments but are stored as incomplete
+   metadata records instead of failing the run.
+9. Attachments go through the **existing** resource pipeline: `_process_resource` →
+   `extract_pdf_resource` with `TEXT-BEGIN` and per-resource statuses (`complete`,
+   `access_blocked`, `failed`, `url_unavailable`, `not_applicable` for non-PDF). Commerce
+   attachments currently answer 403, so PDFs are recorded as `access_blocked` with their original
+   URL and metadata retained; no new downloader or Wayback retrieval was added.
+10. The listing page is the authoritative target (`REPORTS_LISTING_URL`). The `api.commerce.gov`
+    `/api/news` endpoint is **not** used for preflight: the audit found 99/112 known reports but no
+    report newer than 2019, so it cannot detect newly published reports.
+
+> **Live-access limitation (measured 2026-11-03).** A plain-`httpx` probe of
+> `https://www.commerce.gov/data-and-reports/reports` (and `/robots.txt`) returns **HTTP 403
+> with a Cloudflare `Just a moment...` challenge** for this egress, so the cheap preflight
+> currently reports `check_failed` and makes **zero** Firecrawl calls. The code fails safe; it
+> does not substitute `/api/news`, spoof a browser, or launch a historical crawl. Live Commerce
+> ingestion needs an approved access path. This does not affect the Firecrawl listing/detail
+> flows, which are exercised by tests through a mocked provider.
+
+
+Historical acquisition requires the explicit `--bootstrap` flag; an empty database never triggers
+a full historical crawl on its own. Budget limits, response cache, and provider credits used are
+configurable through the `FIRECRAWL_*` settings in `.env.example`.
 
 ### Canadian Bar Association news releases
 

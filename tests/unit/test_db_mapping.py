@@ -87,6 +87,12 @@ def test_document_values_carry_every_persisted_field() -> None:
     assert values["provenance"] == "live"
     assert values["published_precision"] == "day"
     assert values["first_seen_at"] == NOW == values["last_seen_at"]
+    assert values["extraction_attempts"] == 0
+
+
+def test_incomplete_documents_start_with_one_attempt() -> None:
+    """### An incomplete document starts the bounded retry counter at one."""
+    assert document_values(document(status="failed", text=None, published_at=None), now=NOW)["extraction_attempts"] == 1
 
 
 def test_localization_payloads_lead_with_the_primary() -> None:
@@ -192,3 +198,18 @@ def test_error_metadata_constants_are_stable() -> None:
         "document_extraction_error",
         "resource_extraction_error",
     )
+
+
+def test_run_counters_include_budget_accounting() -> None:
+    """### Pending work and provider credits are persisted counters."""
+    counters = run_counters(ActorRunResult(source="commerce_reports", documents_pending=3, provider_credits_used=5))
+    assert counters["documents_pending"] == 3
+    assert counters["provider_credits_used"] == 5
+
+
+def test_run_status_treats_no_change_as_success() -> None:
+    """### A verified no-change run succeeds; a failed check does not."""
+    assert ActorRunResult(source="s", check_outcome="no_change").status == "success"
+    assert ActorRunResult(source="s", check_outcome="check_failed", errors=["boom"]).status == "failed"
+    assert ActorRunResult(source="s", check_outcome="check_failed").status == "failed"
+    assert ActorRunResult(source="s", check_outcome="new_data").status == "failed"

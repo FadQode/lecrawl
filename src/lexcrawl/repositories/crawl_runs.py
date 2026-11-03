@@ -56,6 +56,7 @@ def upsert_run_source(
     error_summary: str | None,
     started_at: datetime,
     finished_at: datetime,
+    check_outcome: str | None = None,
 ) -> int:
     """### Insert or replace one source outcome inside a run."""
     values: dict[str, object] = {
@@ -64,6 +65,7 @@ def upsert_run_source(
         "status": status,
         "pagination_complete": pagination_complete,
         "error_summary": error_summary,
+        "check_outcome": check_outcome,
         "started_at": started_at,
         "finished_at": finished_at,
         **counters,
@@ -72,6 +74,7 @@ def upsert_run_source(
         "status": status,
         "pagination_complete": pagination_complete,
         "error_summary": error_summary,
+        "check_outcome": check_outcome,
         "started_at": started_at,
         "finished_at": finished_at,
         **counters,
