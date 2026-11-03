@@ -245,3 +245,51 @@ def test_bilingual_flag_and_secondary_listing_reach_the_actor() -> None:
     assert without_flag.bilingual is False
     assert with_flag.bilingual is True
     assert with_flag.secondary_listing_url == "https://listing.example.test/en/news"
+
+
+def test_crawl_persist_calls_the_persistence_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """### `--persist` hands the run report to persistence after the crawl."""
+    report = build_report(documents=2)
+    monkeypatch.setattr("lexcrawl.cli.run_crawl", lambda actors, fetcher: report)
+    persisted: list[object] = []
+    monkeypatch.setattr("lexcrawl.cli.persist_report", lambda value, settings: persisted.append(value) or 0)
+
+    arguments = ["crawl", "--source", "uae", "--persist", "--out", str(tmp_path), "--log-format", "console"]
+    assert main(arguments, build_settings()) == 0
+    assert persisted == [report]
+    assert "status=success" in capsys.readouterr().out
+
+
+def test_crawl_persist_failure_returns_non_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """### A persistence failure is reported and fails the command."""
+    monkeypatch.setattr("lexcrawl.cli.run_crawl", lambda actors, fetcher: build_report(documents=1))
+    monkeypatch.setattr("lexcrawl.cli.persist_report", lambda value, settings: 1)
+
+    arguments = ["crawl", "--source", "uae", "--persist", "--out", str(tmp_path), "--log-format", "console"]
+    assert main(arguments, build_settings()) == 1
+    assert "records written to" in capsys.readouterr().out
+
+
+def test_crawl_without_persist_does_not_touch_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """### Database persistence stays opt-in."""
+    monkeypatch.setattr("lexcrawl.cli.run_crawl", lambda actors, fetcher: build_report(documents=1))
+
+    def forbidden(*_: object) -> int:
+        """### Fail if persistence is attempted."""
+        raise AssertionError("persistence must not run without --persist")
+
+    monkeypatch.setattr("lexcrawl.cli.persist_report", forbidden)
+    arguments = ["crawl", "--source", "uae", "--out", str(tmp_path), "--log-format", "console"]
+    assert main(arguments, build_settings()) == 0

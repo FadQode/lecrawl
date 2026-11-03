@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://lexcrawl:lexcrawl@localhost:5432/lexcrawl"
     db_pool_size: int = Field(default=5, gt=0)
     db_max_overflow: int = Field(default=5, ge=0)
+    db_pool_timeout: float = Field(default=30.0, gt=0)
+    db_connect_timeout: int = Field(default=10, gt=0)
+    db_echo: bool = False
 
     api_host: str = "0.0.0.0"
     api_port: int = Field(default=8000, gt=0, le=65535)

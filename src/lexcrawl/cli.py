@@ -7,6 +7,7 @@ import json
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from lexcrawl.actors.base import Actor
@@ -17,8 +18,15 @@ from lexcrawl.config import Settings, get_settings, split_list
 from lexcrawl.crawling.base import Fetcher
 from lexcrawl.crawling.browser import BrowserFetcher
 from lexcrawl.crawling.http import HttpFetcher
+from lexcrawl.db.engine import create_db_engine
+from lexcrawl.db.seed import seed_sources
+from lexcrawl.db.session import create_session_factory, session_scope
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
+from lexcrawl.persistence import persist_crawl_report
+
+if TYPE_CHECKING:
+    from alembic.config import Config
 
 LOG = get_logger(__name__)
 
@@ -48,6 +56,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crawl.add_argument("--log-level", default=None)
     crawl.add_argument("--log-format", choices=["json", "console"], default=None)
+    crawl.add_argument(
+        "--persist",
+        action="store_true",
+        help="persist this run and its documents to PostgreSQL in addition to JSON output",
+    )
+
+    database = subcommands.add_parser("db", help="database schema and registry maintenance")
+    database_commands = database.add_subparsers(dest="db_command", required=True)
+    upgrade = database_commands.add_parser("upgrade", help="apply pending migrations")
+    upgrade.add_argument("--revision", default="head", help="target revision (defaults to head)")
+    database_commands.add_parser("current", help="show the applied revision")
+    revision = database_commands.add_parser("revision", help="create an empty migration revision")
+    revision.add_argument("-m", "--message", required=True, help="revision message")
+    database_commands.add_parser("seed", help="insert the source registry entries")
     return parser
 
 
@@ -217,11 +239,68 @@ def write_documents(path: Path, report: CrawlRunReport) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def alembic_configuration(settings: Settings) -> Config:
+    """### Build an Alembic configuration bound to the application database URL."""
+    from alembic.config import Config
+
+    configuration = Config("alembic.ini")
+    configuration.set_main_option("sqlalchemy.url", settings.database_url)
+    return configuration
+
+
+def run_db_command(arguments: argparse.Namespace, settings: Settings) -> int:
+    """### Execute a database maintenance subcommand."""
+    from alembic import command
+
+    configuration = alembic_configuration(settings)
+    if arguments.db_command == "upgrade":
+        command.upgrade(configuration, arguments.revision)
+        print(f"database upgraded to {arguments.revision}")
+        return 0
+    if arguments.db_command == "current":
+        command.current(configuration)
+        return 0
+    if arguments.db_command == "revision":
+        command.revision(configuration, message=arguments.message, autogenerate=False)
+        print("empty revision created")
+        return 0
+    if arguments.db_command == "seed":
+        engine = create_db_engine(settings)
+        factory = create_session_factory(engine)
+        try:
+            with session_scope(factory) as session:
+                created = seed_sources(session)
+        finally:
+            engine.dispose()
+        print(f"source registry seeded ({created} created)")
+        return 0
+    print(f"unknown database command {arguments.db_command!r}")
+    return 2
+
+
+def persist_report(report: CrawlRunReport, settings: Settings) -> int:
+    """### Persist a crawl report and report the stored run identity."""
+    engine = create_db_engine(settings)
+    factory = create_session_factory(engine)
+    try:
+        persisted = persist_crawl_report(factory, report)
+    finally:
+        engine.dispose()
+    print(f"persisted run {persisted.run_id} status={persisted.status}")
+    return 0 if persisted.status == "success" else 1
+
+
 def main(argv: list[str] | None = None, settings: Settings | None = None) -> int:
     """### Run the CLI and return a process exit code."""
     arguments = build_parser().parse_args(argv)
     settings = settings or get_settings()
-    configure_logging(arguments.log_level or settings.log_level, arguments.log_format or settings.log_format)
+    configure_logging(
+        getattr(arguments, "log_level", None) or settings.log_level,
+        getattr(arguments, "log_format", None) or settings.log_format,
+    )
+
+    if arguments.command == "db":
+        return run_db_command(arguments, settings)
 
     try:
         actors = build_actors(arguments, settings)
@@ -242,7 +321,16 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         # $ Never leave an empty JSON file that a reader could mistake for collected data.$
         print("no records collected; nothing written")
         LOG.info("crawl_finished", extra=report.summary() | {"output": None})
-    return 0 if report.status == "success" else 1
+
+    crawl_succeeded = report.status == "success"
+    if arguments.persist:
+        try:
+            persist_succeeded = persist_report(report, settings) == 0
+        except Exception as error:  # $ Persistence failures are reported, never hidden.$
+            print(f"persistence error: {error}")
+            persist_succeeded = False
+        return 0 if crawl_succeeded and persist_succeeded else 1
+    return 0 if crawl_succeeded else 1
 
 
 if __name__ == "__main__":

@@ -337,6 +337,21 @@ stealth flags, or challenge solving). Collecting that source fully needs an appr
 path: run from a network the site allows, or ask the site operator to permit the crawler's
 user agent.
 
+## Persistence
+
+PostgreSQL storage for the canonical ingestion output is available under `src/lexcrawl/db/`,
+`src/lexcrawl/repositories/`, and `src/lexcrawl/persistence.py`, with Alembic migrations in
+`migrations/`. Persistence is opt-in (`--persist`) and never changes the JSON output. Full schema,
+identity/idempotency rules, the canonical→database mapping, and operational commands are documented
+in [`docs/database.md`](docs/database.md).
+
+```bash
+docker build -t lexcrawl-postgres:16 docker/postgres
+docker run -d --name lexcrawl-postgres -p 5432:5432 lexcrawl-postgres:16
+uv run lexcrawl db upgrade && uv run lexcrawl db seed
+uv run lexcrawl crawl --source uae --persist
+```
+
 ## Development
 
 ```bash

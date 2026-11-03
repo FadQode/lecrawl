@@ -59,6 +59,10 @@ extend-exclude = [".agents", ".claude", ".grok", ".kilo", "migrations"]
 select = ["E", "F", "I", "B", "UP", "SIM", "PTH", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
+[tool.ruff.lint.per-file-ignores]
+# $ Alembic imports the model modules for their side effect of registering tables.$
+"migrations/env.py" = ["F401"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
