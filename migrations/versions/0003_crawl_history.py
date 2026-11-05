@@ -56,13 +56,9 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("run_id", name="uq_crawl_runs_run_id"),
         sa.CheckConstraint("trigger_type IN ('manual', 'scheduled')", name="trigger_type_values"),
-        sa.CheckConstraint(
-            "status IN ('running', 'success', 'partial_failure', 'failed')", name="status_values"
-        ),
+        sa.CheckConstraint("status IN ('running', 'success', 'partial_failure', 'failed')", name="status_values"),
         sa.CheckConstraint("duration_ms IS NULL OR duration_ms >= 0", name="duration_non_negative"),
-        sa.CheckConstraint(
-            "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
-        ),
+        sa.CheckConstraint("finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"),
     )
 
     columns = [
@@ -94,13 +90,9 @@ def upgrade() -> None:
         "crawl_run_sources",
         *columns,
         sa.UniqueConstraint("crawl_run_id", "source_id", name="uq_crawl_run_sources_crawl_run_id_source_id"),
-        sa.CheckConstraint(
-            "status IN ('success', 'partial_failure', 'failed')", name="status_values"
-        ),
+        sa.CheckConstraint("status IN ('success', 'partial_failure', 'failed')", name="status_values"),
         sa.CheckConstraint(COUNTERS_NON_NEGATIVE, name="counters_non_negative"),
-        sa.CheckConstraint(
-            "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
-        ),
+        sa.CheckConstraint("finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"),
     )
 
     op.create_index("ix_crawl_runs_started_at", "crawl_runs", [sa.text("started_at DESC")])

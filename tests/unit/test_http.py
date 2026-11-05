@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gzip
 import logging
+import zlib
 
 import httpx
 import pytest
@@ -288,3 +290,102 @@ def test_robots_is_requested_once_per_host(clock: ClockRecorder) -> None:
     fetcher.fetch(ARTICLE_URL)
     fetcher.fetch(OTHER_URL)
     assert robots_route.call_count == 1
+
+
+def compressed_response(body: bytes, encoding: str) -> httpx.Response:
+    """### Build a mocked response whose body is compressed with the advertised encoding."""
+    payload = gzip.compress(body) if encoding == "gzip" else zlib.compress(body)
+    return httpx.Response(
+        200,
+        content=payload,
+        headers={"content-type": "text/html; charset=utf-8", "content-encoding": encoding},
+    )
+
+
+def malformed_response(encoding: str) -> httpx.Response:
+    """### Build a mocked response that advertises an encoding it does not actually use."""
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8", "content-encoding": encoding},
+        stream=httpx.ByteStream(b"this body is not compressed at all"),
+    )
+
+
+@respx.mock
+def test_fetch_decodes_gzip_exactly_once(clock: ClockRecorder) -> None:
+    """### A gzip response is decompressed once and returned as plain text."""
+    respx.get(ARTICLE_URL).mock(return_value=compressed_response(OK_BODY, "gzip"))
+    page = build_fetcher(clock).fetch(ARTICLE_URL)
+    assert page.status_code == 200
+    assert page.content == OK_BODY
+    assert page.content_type.startswith("text/html")
+
+
+@respx.mock
+def test_fetch_decodes_deflate_exactly_once(clock: ClockRecorder) -> None:
+    """### A deflate response is decompressed once and returned as plain text."""
+    respx.get(ARTICLE_URL).mock(return_value=compressed_response(OK_BODY, "deflate"))
+    page = build_fetcher(clock).fetch(ARTICLE_URL)
+    assert page.content == OK_BODY
+
+
+@respx.mock
+def test_fetch_returns_bytes_unchanged_without_content_encoding(clock: ClockRecorder) -> None:
+    """### An unadvertised compressed body is returned verbatim, because nothing claims to encode it."""
+    payload = gzip.compress(OK_BODY)
+    respx.get(ARTICLE_URL).mock(return_value=httpx.Response(200, content=payload, headers=HTML_HEADERS))
+    page = build_fetcher(clock).fetch(ARTICLE_URL)
+    assert page.content == payload
+
+
+def test_buffered_response_drops_stale_body_headers() -> None:
+    """### Rebuilding a response never keeps the old content-encoding or content-length."""
+    original = httpx.Response(
+        200,
+        headers={
+            "content-type": "text/html",
+            "content-encoding": "gzip",
+            "content-length": "42",
+            "retry-after": "3",
+        },
+        stream=httpx.ByteStream(b""),
+        request=httpx.Request("GET", ARTICLE_URL),
+    )
+    rebuilt = HttpFetcher._buffered_response(original, b"decoded bytes")
+
+    assert "content-encoding" not in rebuilt.headers
+    # $ The stale length is replaced by httpx with the decoded body's true length.$
+    assert rebuilt.headers["content-length"] == str(len(b"decoded bytes"))
+    assert rebuilt.headers["content-type"] == "text/html"
+    assert rebuilt.headers["retry-after"] == "3"
+    assert rebuilt.content == b"decoded bytes"
+
+
+@respx.mock
+def test_malformed_gzip_is_a_typed_fetch_error(clock: ClockRecorder) -> None:
+    """### A body that lies about being gzip fails as a FetchError, never as a bare DecodingError."""
+    route = respx.get(ARTICLE_URL).mock(return_value=malformed_response("gzip"))
+    with pytest.raises(FetchError) as error:
+        build_fetcher(clock, max_retries=2).fetch(ARTICLE_URL)
+    assert "invalid HTTP response" in str(error.value)
+    assert not isinstance(error.value, TransientFetchError)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_malformed_deflate_is_a_typed_fetch_error(clock: ClockRecorder) -> None:
+    """### A malformed deflate body is reported as a typed FetchError without retrying."""
+    route = respx.get(ARTICLE_URL).mock(return_value=malformed_response("deflate"))
+    with pytest.raises(FetchError) as error:
+        build_fetcher(clock, max_retries=3).fetch(ARTICLE_URL)
+    assert not isinstance(error.value, TransientFetchError)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_transport_error_is_typed_and_retried(clock: ClockRecorder) -> None:
+    """### A non-timeout transport error is transient and retried to exhaustion."""
+    route = respx.get(ARTICLE_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+    with pytest.raises(TransientFetchError):
+        build_fetcher(clock, max_retries=1, backoff_seconds=0.0).fetch(ARTICLE_URL)
+    assert route.call_count == 2

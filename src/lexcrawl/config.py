@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     crawl_respect_robots_txt: bool = True
     crawl_max_listing_pages: int = Field(default=25, ge=1)
     crawl_engine: Literal["http", "browser"] = "http"
+    # $ The primary source only serves a rendered document, so it defaults to the browser.$
+    uae_crawl_engine: Literal["http", "browser"] = "browser"
 
     # $ Source locations are supplied by the environment, so the repository names no site.$
     listings_url: str = ""
@@ -90,6 +92,9 @@ class Settings(BaseSettings):
     browser_headless: bool = True
     browser_wait_until: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
     browser_settle_milliseconds: int = Field(default=250, ge=0)
+    # $ A blocked browser session is closed and replaced so a crawl can continue.$
+    browser_max_sessions: int = Field(default=50, ge=1)
+    browser_blocked_session_limit: int = Field(default=3, ge=1)
 
     pdf_max_bytes: int = Field(default=26_214_400, gt=0)
     pdf_extraction_timeout_seconds: float = Field(default=60.0, gt=0)

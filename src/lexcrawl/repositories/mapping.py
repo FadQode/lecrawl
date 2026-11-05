@@ -26,6 +26,39 @@ TRANSLATION_ERROR_TYPE = "translation_error"
 RESOURCE_ERROR_TYPE = "resource_extraction_error"
 EXTRACTION_STAGE = "extract"
 MAX_MESSAGE_LENGTH = 2000
+
+# $ Actor error phrasing mapped to the existing crawl_errors.stage vocabulary.$
+_RUN_ERROR_MARKERS: tuple[tuple[str, str, str], ...] = (
+    ("change detection fetch failed", "fetch", "fetch_error"),
+    ("listing fetch failed", "fetch", "fetch_error"),
+    ("article fetch failed", "fetch", "fetch_error"),
+    ("firecrawl listing failed", "fetch", "fetch_error"),
+    ("materialization failed", "fetch", "fetch_error"),
+    ("returned http", "fetch", "fetch_error"),
+    ("fetch failed", "fetch", "fetch_error"),
+    ("listing parse failed", "parse", "parse_error"),
+    ("article parse failed", "parse", "parse_error"),
+    ("did not contain the report table", "parse", "parse_error"),
+    ("no report table", "parse", "parse_error"),
+    ("unusable listing record", "parse", "parse_error"),
+    ("pagination loop detected", "discovery", "discovery_error"),
+    ("no article urls discovered", "discovery", "discovery_error"),
+    ("no news releases matched", "discovery", "discovery_error"),
+    ("listing range gap", "discovery", "discovery_error"),
+    ("listing total changed", "discovery", "discovery_error"),
+    ("were not found while paginating", "discovery", "discovery_error"),
+    ("stopped after hitting", "discovery", "budget_error"),
+    ("resource url unavailable", "extract", "resource_error"),
+    ("resource failed at", "extract", "resource_error"),
+    ("resource access_blocked at", "extract", "resource_error"),
+    ("resource url_unavailable at", "extract", "resource_error"),
+    ("pdf processing failed", "extract", "resource_error"),
+    ("no_completed_localization", "extract", "extraction_error"),
+    ("change detection requires persisted documents", "persistence", "persistence_error"),
+    ("change detection requires the persistence layer", "persistence", "persistence_error"),
+    ("could not load persisted identities", "persistence", "persistence_error"),
+    ("could not load incomplete reports", "persistence", "persistence_error"),
+)
 _SECRET_PATTERNS = (
     (re.compile(r"(://[^:/@\s]+:)[^@\s]+@"), r"\1***@"),
     (re.compile(r"(api_key=)[^&\s]+"), r"\1***"),
@@ -224,16 +257,23 @@ def run_counters(result: ActorRunResult) -> dict[str, int]:
     }
 
 
+def classify_run_error(message: str) -> tuple[str, str]:
+    """### Map an actor error string to the closest existing stage and category."""
+    lowered = message.lower()
+    for marker, stage, error_type in _RUN_ERROR_MARKERS:
+        if marker in lowered:
+            return stage, error_type
+    return RUN_ERROR_STAGE, RUN_ERROR_TYPE
+
+
 def run_error_payloads(result: ActorRunResult) -> list[ErrorPayload]:
-    """### Convert run-level error strings into redacted, unattributed error rows."""
-    return [
-        ErrorPayload(
-            stage=RUN_ERROR_STAGE,
-            error_type=RUN_ERROR_TYPE,
-            message=redact_secrets(str(message)),
-        )
-        for message in result.errors
-    ]
+    """### Convert run-level error strings into classified, redacted error rows."""
+    payloads: list[ErrorPayload] = []
+    for message in result.errors:
+        text = str(message)
+        stage, error_type = classify_run_error(text)
+        payloads.append(ErrorPayload(stage=stage, error_type=error_type, message=redact_secrets(text)))
+    return payloads
 
 
 def error_summary(result: ActorRunResult, *, limit: int = 4000) -> str | None:

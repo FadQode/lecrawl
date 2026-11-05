@@ -96,6 +96,7 @@ class PlaywrightBrowserSession:
         blocked: list[str] = []
 
         def guard_navigation(route: Any) -> None:
+            """### Abort sub-resources and off-host navigations before they leave the page."""
             request = route.request
             if request.resource_type in {"image", "media", "font"}:
                 route.abort()

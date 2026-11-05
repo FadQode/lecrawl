@@ -361,14 +361,14 @@ def test_counters_and_error_attribution(session_factory: sessionmaker[Session]) 
         assert run_source.pagination_complete is True
 
         errors = session.execute(select(CrawlError).order_by(CrawlError.id)).scalars().all()
-        assert {error.error_type for error in errors} == {"actor_error", "resource_extraction_error"}
+        assert {error.error_type for error in errors} == {"fetch_error", "resource_extraction_error"}
         for error in errors:
             references = (error.document_id, error.localization_id, error.resource_id)
             assert sum(reference is not None for reference in references) <= 1
         resource_error = next(error for error in errors if error.error_type == "resource_extraction_error")
         assert resource_error.resource_id is not None
         assert all("SECRET" not in error.message for error in errors)
-        assert "api_key=***" in next(error.message for error in errors if error.error_type == "actor_error")
+        assert "api_key=***" in next(error.message for error in errors if error.error_type == "fetch_error")
 
 
 def test_repeated_source_persistence_is_idempotent(session_factory: sessionmaker[Session]) -> None:

@@ -38,11 +38,15 @@ _TEXT_CONTENT_TYPES = (
     "application/xhtml+xml",
 )
 
+# $ Body framing headers httpx has already applied, so they must not survive a rebuild.$
+_DECOMPRESSED_HEADERS = frozenset({"content-encoding", "content-length"})
+
 
 class _RedactHttpxRequestUrls(logging.Filter):
-    """Remove credential query values from HTTPX request log records."""
+    """### Remove credential query values from HTTPX request log records."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """### Redact URL arguments on every emitted HTTPX log record."""
         if isinstance(record.args, tuple):
             record.args = tuple(
                 redact_url(str(value)) if isinstance(value, httpx.URL) else value for value in record.args
@@ -284,18 +288,29 @@ class HttpFetcher:
                             status_code=response.status_code,
                         )
                     chunks.append(chunk)
-                buffered = httpx.Response(
-                    response.status_code,
-                    headers=response.headers,
-                    content=b"".join(chunks),
-                    request=response.request,
-                    extensions=response.extensions,
-                )
+                buffered = self._buffered_response(response, b"".join(chunks))
         except httpx.TimeoutException as error:
             raise TransientFetchError(f"timeout after {self._timeout_seconds}s: {error}", url=url) from error
         except httpx.TransportError as error:
             raise TransientFetchError(f"transport error: {error}", url=url) from error
+        except httpx.HTTPError as error:
+            # $ A malformed response (bad compression, protocol failure) becomes a typed error.$
+            raise FetchError(f"invalid HTTP response: {error}", url=url) from error
         return self._translate(buffered, url, require_text=require_text), None
+
+    @staticmethod
+    def _buffered_response(response: httpx.Response, content: bytes) -> httpx.Response:
+        """### Rebuild a response from decoded content without stale body framing headers."""
+        headers = [
+            (key, value) for key, value in response.headers.multi_items() if key.lower() not in _DECOMPRESSED_HEADERS
+        ]
+        return httpx.Response(
+            response.status_code,
+            headers=headers,
+            content=content,
+            request=response.request,
+            extensions=response.extensions,
+        )
 
     def _translate(self, response: httpx.Response, url: str, *, require_text: bool = True) -> FetchedPage:
         """### Convert an HTTP response into a page or a typed failure."""

@@ -71,7 +71,9 @@ def downgrade() -> None:
     op.create_check_constraint(
         "counters_non_negative",
         "crawl_run_sources",
-        " AND ".join(f"{column} >= 0" for column in COUNTERS if column not in {"documents_pending", "provider_credits_used"}),
+        " AND ".join(
+            f"{column} >= 0" for column in COUNTERS if column not in {"documents_pending", "provider_credits_used"}
+        ),
     )
     op.drop_column("crawl_run_sources", "check_outcome")
     op.drop_column("crawl_run_sources", "provider_credits_used")

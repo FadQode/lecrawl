@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from lexcrawl.actors.base import ActorRunResult
@@ -121,7 +123,7 @@ def _persist_document(
     for index, payload in enumerate(localization_payloads(document)):
         localization_id = upsert_localization(session, document_id=document_id, payload=payload, now=now)
         if index > 0 and payload.error:
-            # $ The primary error is recorded on the document; translations keep their own.
+            # $ The primary error is recorded on the document; translations keep their own.$
             errors.append(
                 AttributedError(
                     payload=ErrorPayload(
@@ -223,8 +225,14 @@ def persist_crawl_report(
     *,
     trigger_type: str = DEFAULT_TRIGGER,
     started_at: datetime | None = None,
+    run_id: UUID | None = None,
 ) -> PersistedCrawlRun:
-    """### Persist one crawl report with one transaction per source actor."""
+    """### Persist one crawl report with one transaction per source actor.
+
+    When `run_id` is given, results are attached to that already-created run instead of
+    creating a new one; this lets an API-triggered crawl reuse the running record the trigger
+    created. Otherwise a new run row is created (the CLI behaviour).
+    """
     started = started_at or datetime.now(tz=UTC)
     with session_scope(session_factory) as session:
         # $ An unregistered source has no registry row, so the run is refused before any write.$
@@ -234,10 +242,19 @@ def persist_crawl_report(
             f"sources not registered: {sorted(set(missing))}; run `lexcrawl db seed` before persisting"
         )
 
-    with session_scope(session_factory) as session:
-        run = create_run(session, trigger_type=trigger_type, started_at=started)
-        run_id = run.run_id
-        run_pk = run.id
+    if run_id is None:
+        with session_scope(session_factory) as session:
+            run = create_run(session, trigger_type=trigger_type, started_at=started)
+            persisted_run_id = run.run_id
+            run_pk = run.id
+    else:
+        with session_scope(session_factory) as session:
+            existing = session.execute(select(CrawlRun).where(CrawlRun.run_id == run_id)).scalar_one_or_none()
+            if existing is None:
+                raise PersistenceError(f"crawl run {run_id} was not found")
+            persisted_run_id = existing.run_id
+            run_pk = existing.id
+            started = existing.started_at
 
     outcomes: list[PersistedSourceRun] = []
     for result in report.results:
@@ -258,7 +275,55 @@ def persist_crawl_report(
     with session_scope(session_factory) as session:
         stored_run = session.get(CrawlRun, run_pk)
         if stored_run is None:
-            raise PersistenceError(f"crawl run {run_id} disappeared before finalisation")
+            raise PersistenceError(f"crawl run {persisted_run_id} disappeared before finalisation")
         finalize_run(session, run=stored_run, status=status, finished_at=finished, duration_ms=duration_ms)
 
-    return PersistedCrawlRun(run_id=run_id, status=status, sources=tuple(outcomes))
+    return PersistedCrawlRun(run_id=persisted_run_id, status=status, sources=tuple(outcomes))
+
+
+def persist_run_failure(
+    session_factory: sessionmaker[Session],
+    run_id: UUID,
+    *,
+    source_codes: Sequence[str],
+    message: str,
+) -> None:
+    """### Record a worker failure against an existing running run and finalize it as failed.
+
+    Used when a triggered crawl fails before a report can be persisted, so the run never stays
+    indefinitely marked as running. A run that is no longer running is left untouched.
+    """
+    timestamp = datetime.now(tz=UTC)
+    safe = redact_secrets(message)
+    with session_scope(session_factory) as session:
+        run = session.execute(select(CrawlRun).where(CrawlRun.run_id == run_id)).scalar_one_or_none()
+        if run is None:
+            raise PersistenceError(f"crawl run {run_id} was not found")
+        if run.status != "running":
+            return
+        for code in source_codes:
+            source_id = source_id_for(session, code)
+            if source_id is None:
+                continue
+            run_source_id = upsert_run_source(
+                session,
+                crawl_run_id=run.id,
+                source_id=source_id,
+                status="failed",
+                counters=run_counters(ActorRunResult(source=code)),
+                pagination_complete=False,
+                error_summary=safe,
+                started_at=run.started_at,
+                finished_at=timestamp,
+                check_outcome=None,
+            )
+            replace_errors(
+                session,
+                crawl_run_source_id=run_source_id,
+                errors=(
+                    AttributedError(payload=ErrorPayload(stage="unknown", error_type="worker_error", message=safe)),
+                ),
+                occurred_at=timestamp,
+            )
+        duration_ms = int((timestamp - run.started_at).total_seconds() * 1000)
+        finalize_run(session, run=run, status="failed", finished_at=timestamp, duration_ms=duration_ms)

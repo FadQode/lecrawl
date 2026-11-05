@@ -6,7 +6,8 @@ from datetime import date
 
 from lexcrawl.actors.base import ActorRunResult
 from lexcrawl.actors.uae_legislation import UaeLegislationActor, parse_listing
-from lexcrawl.crawling.base import AccessBlockedError, FetchError
+from lexcrawl.crawling.base import AccessBlockedError, FetchedPage, Fetcher, FetchError
+from lexcrawl.crawling.rotating import RotatingFetcher
 from lexcrawl.models.document import TEXT_BEGIN_MARKER, CanonicalDocument, RawArticle
 
 from ..conftest import StubFetcher
@@ -237,3 +238,55 @@ def test_run_result_status_semantics() -> None:
     assert ActorRunResult(source="s", errors=["boom"]).status == "failed"
     assert ActorRunResult(source="s", documents=[document]).status == "success"
     assert ActorRunResult(source="s", documents=[document], errors=["boom"]).status == "partial_failure"
+
+
+class RotationSession(StubFetcher):
+    """### A stub session that refuses one URL once, simulating a Cloudflare block."""
+
+    engine_name = "browser"
+
+    def __init__(self, pages: dict[str, bytes], *, block_once: set[str]) -> None:
+        """### Record the URL this session refuses on its first request."""
+        super().__init__(pages)
+        self._block_once = set(block_once)
+
+    def fetch(self, url: str) -> FetchedPage:
+        """### Refuse the pinned URL once, then serve every request normally."""
+        if url in self._block_once:
+            self._block_once.discard(url)
+            raise AccessBlockedError("blocked", url=url, status_code=403, reason="cloudflare")
+        return super().fetch(url)
+
+
+def uae_pages() -> tuple[dict[str, bytes], str]:
+    """### Build the canned UAE listing and detail pages plus the first article URL."""
+    listing_body = listing_html()
+    pages = {LISTING_URL: listing_body, PAGE_TWO_URL: listing_body}
+    stubs = parse_listing(listing_body, LISTING_URL).stubs
+    for stub in stubs:
+        pages[stub.url] = detail_html()
+    return pages, stubs[0].url
+
+
+def test_browser_rotation_resumes_without_duplicate_documents() -> None:
+    """### A blocked session is replaced, the crawl resumes, and one document per article remains."""
+    pages, first_article = uae_pages()
+    created: list[RotationSession] = []
+
+    def factory() -> RotationSession:
+        """### Block the first article only in the first session."""
+        session = RotationSession(pages, block_once={first_article} if not created else set())
+        created.append(session)
+        return session
+
+    fetcher: Fetcher = RotatingFetcher(factory, engine_name="browser", max_sessions=5, blocked_session_limit=3)
+    result = build_actor().run(fetcher)
+
+    assert len(created) == 2
+    assert created[0].calls.count(first_article) == 0
+    assert created[1].calls.count(first_article) == 1
+    assert result.detail_pages_succeeded == 20
+    assert len(result.documents) == 20
+    identities = [document.identity_key for document in result.documents]
+    assert len(identities) == len(set(identities))
+    assert all(document.text.startswith(TEXT_BEGIN_MARKER) for document in result.documents)

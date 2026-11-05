@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
 
+import httpx
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
@@ -779,6 +780,10 @@ class CommerceReportsActor(Actor):
         except ValueError as error:
             status = "failed"
             message = str(error)
+        except httpx.HTTPError as error:
+            # $ A malformed attachment response is isolated to this resource, never the run.$
+            status = "failed"
+            message = f"attachment fetch failed: {error}"
         self._logger.warning(
             "pdf_resource_failed",
             extra={"url": redact_url(resource.original_url), "parent_url": redact_url(report_url), "status": status},

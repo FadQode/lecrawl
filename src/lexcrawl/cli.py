@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Callable
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +19,7 @@ from lexcrawl.crawling.base import Fetcher
 from lexcrawl.crawling.browser import BrowserFetcher
 from lexcrawl.crawling.firecrawl import FirecrawlClient
 from lexcrawl.crawling.http import HttpFetcher
+from lexcrawl.crawling.rotating import RotatingFetcher
 from lexcrawl.db.engine import create_db_engine
 from lexcrawl.db.seed import seed_sources
 from lexcrawl.db.session import create_session_factory, session_scope
@@ -136,6 +136,16 @@ def crawl_engine(arguments: argparse.Namespace, settings: Settings) -> str:
     return arguments.engine or settings.crawl_engine
 
 
+def engine_for_source(name: str, arguments: argparse.Namespace, settings: Settings) -> str:
+    """### Resolve one source's engine: explicit flag, per-source default, then global."""
+    if arguments.engine:
+        return str(arguments.engine)
+    if name == "uae":
+        # $ The primary source refuses plain HTTP, so it renders through the browser by default.$
+        return settings.uae_crawl_engine
+    return settings.crawl_engine
+
+
 def build_actors(arguments: argparse.Namespace, settings: Settings) -> list[Actor]:
     """### Instantiate the actors selected on the command line."""
     names = list(SOURCE_NAMES) if arguments.source == "all" else [arguments.source]
@@ -149,7 +159,7 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             listing_url=settings.listings_url,
             language=settings.listings_language,
             max_listing_pages=page_bound(arguments, settings),
-            concurrency=concurrency(arguments, settings),
+            concurrency=concurrency(arguments, settings, engine=engine_for_source(name, arguments, settings)),
             bilingual=settings.crawl_bilingual or arguments.bilingual,
             secondary_listing_url=settings.listings_secondary_url,
         )
@@ -188,9 +198,9 @@ def page_bound(arguments: argparse.Namespace, settings: Settings) -> int:
     return arguments.max_pages if arguments.max_pages is not None else settings.crawl_max_listing_pages
 
 
-def concurrency(arguments: argparse.Namespace, settings: Settings) -> int:
+def concurrency(arguments: argparse.Namespace, settings: Settings, *, engine: str | None = None) -> int:
     """### Resolve detail concurrency, forcing a single thread for the browser."""
-    if crawl_engine(arguments, settings) == "browser":
+    if (engine or crawl_engine(arguments, settings)) == "browser":
         return 1
     return arguments.concurrency if arguments.concurrency is not None else settings.crawl_concurrency_per_source
 
@@ -235,21 +245,31 @@ def redirect_host_allowlist(settings: Settings) -> tuple[str, ...]:
     return tuple(sorted(hosts))
 
 
-def build_fetcher(arguments: argparse.Namespace, settings: Settings) -> Fetcher:
-    """### Build the crawling strategy selected by the CLI or settings."""
-    if crawl_engine(arguments, settings) == "browser":
-        return BrowserFetcher(
-            user_agent=settings.crawl_user_agent,
-            timeout_seconds=request_timeout(arguments, settings),
-            max_retries=retry_budget(arguments, settings),
-            backoff_seconds=settings.crawl_retry_backoff_seconds,
-            request_delay_seconds=request_delay(arguments, settings),
-            respect_robots_txt=robots_enabled(arguments, settings),
-            allowed_redirect_hosts=redirect_host_allowlist(settings),
-            max_response_bytes=settings.pdf_max_bytes,
-            headless=settings.browser_headless and not arguments.headed,
-            wait_until=settings.browser_wait_until,
-            settle_milliseconds=settings.browser_settle_milliseconds,
+def build_fetcher(arguments: argparse.Namespace, settings: Settings, *, engine: str | None = None) -> Fetcher:
+    """### Build the crawling strategy selected by the CLI, settings, or source default."""
+    if (engine or crawl_engine(arguments, settings)) == "browser":
+        # $ A blocked browser session is replaced so the crawl continues where it stopped.$
+        def make_browser() -> BrowserFetcher:
+            """### Build one fresh browser session."""
+            return BrowserFetcher(
+                user_agent=settings.crawl_user_agent,
+                timeout_seconds=request_timeout(arguments, settings),
+                max_retries=retry_budget(arguments, settings),
+                backoff_seconds=settings.crawl_retry_backoff_seconds,
+                request_delay_seconds=request_delay(arguments, settings),
+                respect_robots_txt=robots_enabled(arguments, settings),
+                allowed_redirect_hosts=redirect_host_allowlist(settings),
+                max_response_bytes=settings.pdf_max_bytes,
+                headless=settings.browser_headless and not arguments.headed,
+                wait_until=settings.browser_wait_until,
+                settle_milliseconds=settings.browser_settle_milliseconds,
+            )
+
+        return RotatingFetcher(
+            make_browser,
+            engine_name="browser",
+            max_sessions=settings.browser_max_sessions,
+            blocked_session_limit=settings.browser_blocked_session_limit,
         )
     return HttpFetcher(
         user_agent=settings.crawl_user_agent,
@@ -369,8 +389,23 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         # $ Missing source locations are operator errors, so report them without a traceback.$
         print(f"configuration error: {error}")
         return 2
-    with closing(build_fetcher(arguments, settings)) as fetcher:
-        report = run_crawl(actors, fetcher)
+    # $ Sources may resolve to different engines, so each engine runs its own fetcher.$
+    selected = list(SOURCE_NAMES) if arguments.source == "all" else [arguments.source]
+    report = CrawlRunReport()
+    fetchers: list[Fetcher] = []
+    try:
+        grouped: dict[str, list[Actor]] = {}
+        for name, actor in zip(selected, actors, strict=True):
+            grouped.setdefault(engine_for_source(name, arguments, settings), []).append(actor)
+        for engine, engine_actors in grouped.items():
+            fetcher = build_fetcher(arguments, settings, engine=engine)
+            fetchers.append(fetcher)
+            partial = run_crawl(engine_actors, fetcher)
+            report.results.extend(partial.results)
+            report.duration_seconds += partial.duration_seconds
+    finally:
+        for fetcher in fetchers:
+            fetcher.close()
     for actor in actors:
         close = getattr(actor, "close", None)
         if callable(close):

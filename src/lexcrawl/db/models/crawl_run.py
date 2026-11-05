@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from lexcrawl.db.models.crawl_error import CrawlError
     from lexcrawl.db.models.source import Source
 
-TriggerType = Literal["manual", "scheduled"]
+TriggerType = Literal["manual", "scheduled", "api"]
 TRIGGER_VALUES = get_args(TriggerType)
 RunLifecycleStatus = Literal["running", "success", "partial_failure", "failed"]
 RUN_STATUS_VALUES = get_args(RunLifecycleStatus)

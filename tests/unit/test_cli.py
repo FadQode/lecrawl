@@ -10,10 +10,19 @@ import pytest
 
 from lexcrawl.actors.base import ActorRunResult
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
-from lexcrawl.cli import build_actor, build_actors, build_fetcher, build_parser, main, output_path, render_summary
+from lexcrawl.cli import (
+    build_actor,
+    build_actors,
+    build_fetcher,
+    build_parser,
+    engine_for_source,
+    main,
+    output_path,
+    render_summary,
+)
 from lexcrawl.config import Settings
-from lexcrawl.crawling.browser import BrowserFetcher
 from lexcrawl.crawling.http import HttpFetcher
+from lexcrawl.crawling.rotating import RotatingFetcher
 from lexcrawl.models.document import CanonicalDocument, RawArticle
 from lexcrawl.orchestrator import CrawlRunReport
 
@@ -89,21 +98,65 @@ def test_build_actor_uses_settings_and_cli_overrides() -> None:
     assert default_actor.listing_url == settings.listings_url
     assert default_actor.language == settings.listings_language
     assert default_actor.max_listing_pages == settings.crawl_max_listing_pages
-    assert default_actor.concurrency == settings.crawl_concurrency_per_source
+    # $ UAE defaults to the single-threaded browser engine.$
+    assert default_actor.concurrency == 1
 
     overridden = build_actor("uae", parse(["crawl", "--max-pages", "3", "--concurrency", "1"]), settings)
     assert isinstance(overridden, UaeLegislationActor)
     assert overridden.max_listing_pages == 3
     assert overridden.concurrency == 1
 
+    http_actor = build_actor("uae", parse(["crawl", "--engine", "http"]), settings)
+    assert isinstance(http_actor, UaeLegislationActor)
+    assert http_actor.concurrency == settings.crawl_concurrency_per_source
+
+
+def test_uae_defaults_to_the_browser_engine() -> None:
+    """### The blocked source resolves to the browser unless the flag overrides it."""
+    settings = build_settings()
+    assert engine_for_source("uae", parse(["crawl"]), settings) == "browser"
+    assert engine_for_source("uae", parse(["crawl", "--engine", "http"]), settings) == "http"
+    assert engine_for_source("cba", parse(["crawl"]), settings) == settings.crawl_engine
+
 
 def test_build_fetcher_selects_the_configured_engine() -> None:
     """### The CLI picks the crawling strategy from the flag or settings."""
     settings = build_settings()
     assert isinstance(build_fetcher(parse(["crawl"]), settings), HttpFetcher)
-    assert isinstance(build_fetcher(parse(["crawl", "--engine", "browser"]), settings), BrowserFetcher)
+    assert isinstance(build_fetcher(parse(["crawl", "--engine", "browser"]), settings), RotatingFetcher)
     settings_with_browser = Settings(_env_file=None, crawl_engine="browser")
-    assert isinstance(build_fetcher(parse(["crawl"]), settings_with_browser), BrowserFetcher)
+    browser = build_fetcher(parse(["crawl"]), settings_with_browser)
+    assert isinstance(browser, RotatingFetcher)
+    assert browser.engine_name == "browser"
+
+
+def test_build_fetcher_honours_an_explicit_engine_override() -> None:
+    """### A per-source engine override selects the matching strategy."""
+    settings = build_settings()
+    assert build_fetcher(parse(["crawl"]), settings, engine="browser").engine_name == "browser"
+    assert isinstance(build_fetcher(parse(["crawl"]), settings, engine="http"), HttpFetcher)
+
+
+def test_main_runs_uae_through_the_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """### The UAE source is driven by a rotating browser fetcher by default."""
+    captured: list[object] = []
+
+    def fake_run(actors: object, fetcher: object) -> CrawlRunReport:
+        """### Record the fetcher the CLI selected."""
+        captured.append(fetcher)
+        return build_report(documents=1)
+
+    monkeypatch.setattr("lexcrawl.cli.run_crawl", fake_run)
+    arguments = ["crawl", "--source", "uae", "--out", str(tmp_path), "--log-format", "console"]
+    assert main(arguments, build_settings()) == 0
+    capsys.readouterr()
+    assert len(captured) == 1
+    assert isinstance(captured[0], RotatingFetcher)
+    assert captured[0].engine_name == "browser"
 
 
 def test_browser_engine_is_single_threaded() -> None:
@@ -113,7 +166,7 @@ def test_browser_engine_is_single_threaded() -> None:
     actor = build_actor("uae", arguments, settings)
     assert isinstance(actor, UaeLegislationActor)
     assert actor.concurrency == 1
-    http_actor = build_actor("uae", parse(["crawl", "--concurrency", "8"]), settings)
+    http_actor = build_actor("uae", parse(["crawl", "--engine", "http", "--concurrency", "8"]), settings)
     assert isinstance(http_actor, UaeLegislationActor)
     assert http_actor.concurrency == 8
 

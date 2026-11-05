@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import httpx
 import pytest
 
 from lexcrawl.actors.commerce import (
@@ -712,3 +713,84 @@ def test_discovered_pdf_runs_through_extraction_with_marker() -> None:
     assert resource.text is not None and resource.text.startswith(TEXT_BEGIN_MARKER)
     assert resource.content_hash == compute_content_hash(resource.text)
     assert result.resources_extracted == 1
+
+
+# $ Attachment failure isolation$
+
+
+def malformed_attachment_detail() -> tuple[str, str, str]:
+    """### Build the detail URL and the two attachment URLs shared by the isolation tests."""
+    detail_url = f"{COMMERCE_DETAIL_PREFIX}2025/01/report-1"
+    first = "https://www.commerce.gov/sites/default/files/2025-01/a.pdf"
+    second = "https://www.commerce.gov/sites/default/files/2025-01/b.pdf"
+    return detail_url, first, second
+
+
+def test_malformed_attachment_does_not_abort_the_run() -> None:
+    """### A decompression failure on one attachment is isolated and the report survives."""
+    detail_url, bad, good = malformed_attachment_detail()
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page([], start=21, end=20, total=112),
+            detail_url: commerce_detail_html(
+                "Report 1",
+                paragraphs=("Body " * 40,),
+                attachments=[
+                    ("/sites/default/files/2025-01/a.pdf", "a.pdf", "application/pdf"),
+                    ("/sites/default/files/2025-01/b.pdf", "b.pdf", "application/pdf"),
+                ],
+            ),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    source = StubFetcher(
+        {PAGE0: page_zero(*range(1, 21)).encode("utf-8"), good: build_pdf("Attachment B text")},
+        failures={bad: httpx.DecodingError("Error -3 while decompressing data")},
+        content_types={good: "application/pdf"},
+    )
+    result = build_actor(scraper, known=known).run(source)
+
+    assert len(result.documents) == 1
+    document = result.documents[0]
+    assert document.text is not None and document.text.startswith(TEXT_BEGIN_MARKER)
+    resources = {resource.url: resource for resource in document.resources}
+    assert resources[bad].status == "failed"
+    assert "attachment fetch failed" in (resources[bad].error or "")
+    assert resources[good].status == "complete"
+    assert (resources[good].text or "").startswith(TEXT_BEGIN_MARKER)
+    assert result.resources_failed == 1
+    assert result.resources_extracted == 1
+    assert any("a.pdf" in error for error in result.errors)
+
+
+def test_every_malformed_attachment_leaves_the_report_intact() -> None:
+    """### Attachments that all fail to decode still yield the parent report."""
+    detail_url, first, second = malformed_attachment_detail()
+    scraper = FakeScraper(
+        {
+            PAGE1: listing_page([], start=21, end=20, total=112),
+            detail_url: commerce_detail_html(
+                "Report 1",
+                paragraphs=("Body " * 40,),
+                attachments=[
+                    ("/sites/default/files/2025-01/a.pdf", "a.pdf", "application/pdf"),
+                    ("/sites/default/files/2025-01/b.pdf", "b.pdf", "application/pdf"),
+                ],
+            ),
+        }
+    )
+    known = {identity(i) for i in range(1, 41)} - {identity(1)}
+    source = StubFetcher(
+        {PAGE0: page_zero(*range(1, 21)).encode("utf-8")},
+        failures={
+            first: httpx.DecodingError("Error -3 while decompressing data"),
+            second: httpx.DecodingError("invalid code lengths set"),
+        },
+    )
+    result = build_actor(scraper, known=known).run(source)
+
+    assert len(result.documents) == 1
+    assert result.documents[0].text is not None
+    assert {resource.status for resource in result.documents[0].resources} == {"failed"}
+    assert result.resources_extracted == 0
+    assert result.resources_failed == 2

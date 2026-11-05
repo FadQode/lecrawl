@@ -120,9 +120,7 @@ def upgrade() -> None:
             "file_size_bytes IS NULL OR file_size_bytes >= 0",
             name="file_size_non_negative",
         ),
-        sa.CheckConstraint(
-            "page_count IS NULL OR page_count >= 0", name="page_count_non_negative"
-        ),
+        sa.CheckConstraint("page_count IS NULL OR page_count >= 0", name="page_count_non_negative"),
         sa.CheckConstraint(
             "character_count IS NULL OR character_count >= 0",
             name="character_count_non_negative",

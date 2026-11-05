@@ -99,6 +99,7 @@ def test_unexpected_localization_error_is_isolated_to_one_logical_article(
     original = actor._collect_localization
 
     def fail_one(fetcher: Any, *, stub: Any, language: str, listing_url: str | None) -> Any:
+        """### Fail the pinned Arabic article and delegate every other localization."""
         if stub.url == AR_ARTICLE:
             raise ValueError("malformed localization state")
         return original(fetcher, stub=stub, language=language, listing_url=listing_url)

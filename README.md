@@ -11,8 +11,8 @@ deliberately not committed (see Repository hygiene).
 | Canadian Bar Association (CBA) | news releases | Implemented, **35 live releases collected** (complete pagination pass) |
 
 Only the extracted records are ever kept: no HTML page, PDF, or archived snapshot is stored
-in this repository or on disk. Records are written as timestamped JSON under `data/` until
-the database layer exists.
+in this repository or on disk. Records are written as timestamped JSON under `data/` and can be
+persisted to PostgreSQL with `--persist` or automatically through the API's crawl execution.
 
 ## Environment
 
@@ -24,7 +24,37 @@ the database layer exists.
   `uv run playwright install chromium`.
 - Configuration comes from environment variables; `.env.example` lists every supported
   name and all are validated at startup by `lexcrawl.config.Settings`.
-- `Dockerfile`, `compose.yaml`, and the Alembic scaffold are not created yet.
+- A Docker Compose deployment (`Dockerfile`, `compose.yaml`) and the Alembic migrations in
+  `migrations/` are included; see Quick start.
+
+## Quick start (Docker Compose)
+
+Two services: `api` (FastAPI; applies migrations and seeds sources on start) and `db`
+(PostgreSQL 16 with a persistent volume). The API image installs project dependencies and the
+Playwright Chromium runtime required by the UAE browser engine.
+
+```bash
+cp .env.example .env          # then edit: set POSTGRES_PASSWORD and MANUAL_TRIGGER_TOKEN
+docker compose up -d --build
+docker compose ps             # db healthy, api running
+```
+
+- API: <http://localhost:8000>
+- Swagger UI: <http://localhost:8000/docs>
+- ReDoc: <http://localhost:8000/redoc>
+- OpenAPI JSON: <http://localhost:8000/openapi.json>
+
+Set `API_PORT` to change the host port (the container still listens on 8000). On startup the API
+runs `lexcrawl db upgrade` (applies every pending Alembic revision, including `0007`), then
+`lexcrawl db seed` (idempotent source registry), then serves with a **single** Uvicorn worker.
+Compose builds `DATABASE_URL` to reach the `db` service; the `DATABASE_URL` in `.env` is only for
+local (non-Docker) CLI runs.
+
+```bash
+docker compose logs -f api      # startup, migrations, scheduler lifecycle
+docker compose down            # keeps the named volume lecrawl_lexcrawl-postgres
+docker compose down -v         # also discards the database volume
+```
 
 ## Crawling engines
 
@@ -42,11 +72,21 @@ an access denial and report it as `AccessBlockedError` instead of retrying aroun
 both refuse to retry non-textual payloads such as PDFs or images. API sources are collected
 raw, so an API source is skipped with a recorded error when the rendering engine is selected.
 
+The engine is chosen per source. Commerce and CBA use `CRAWL_ENGINE` (default `http`); the UAE
+source defaults to the browser engine via `UAE_CRAWL_ENGINE=browser`, because the site refuses
+plain HTTP requests. `--engine {http,browser}` overrides the choice for every selected source.
+
+The browser engine is wrapped in a **rotating fetcher**: when a session is refused with
+`AccessBlockedError`, the session is closed, a fresh one is opened, and the same request is
+retried, so a crawl continues where it stopped instead of dropping the remaining records.
+Rotation is bounded by `BROWSER_MAX_SESSIONS` and stops early when
+`BROWSER_BLOCKED_SESSION_LIMIT` consecutive fresh sessions are refused without a single success.
+
 ## Architecture
 
-Modular monolith with an ingestion worker and (planned) API process. Actors are in-process,
-source-specific components behind one shared contract; they emit typed raw records that are
-canonicalized before persistence.
+Modular monolith with an ingestion pipeline, a FastAPI read/trigger API, and an in-process daily
+scheduler. Actors are in-process, source-specific components behind one shared contract; they
+emit typed raw records that are canonicalized before persistence.
 
 ```text
 src/lexcrawl/
@@ -76,7 +116,12 @@ tests/unit/                      # per-source parser/pipeline tests, fetcher, br
 tests/integration/               # real-Chromium render feeding the parser, over a local HTTP server
 tests/samples.py                 # short structural samples used by parser tests (no archived pages)
 data/                            # timestamped extracted records (ignored by git)
-migrations/, src/lexcrawl/{db,repositories,scheduler,api}/   # not implemented yet
+migrations/                      # Alembic revisions 0001..0007
+src/lexcrawl/db/                 # SQLAlchemy engine, session, models, source seeding
+src/lexcrawl/repositories/       # upserts, mapping, run/error persistence helpers
+src/lexcrawl/persistence.py      # report persistence and crawl-run lifecycle
+src/lexcrawl/api/                # FastAPI app, routers, schemas, query/execution services
+src/lexcrawl/scheduler/          # APScheduler daily crawl job
 ```
 
 Dependency direction: `models` (pure contracts) is innermost; `crawling` is the external I/O
@@ -90,8 +135,8 @@ layer.
 ```bash
 uv sync                                                            # install/synchronize dependencies
 uv run lexcrawl crawl --source commerce                            # live Commerce report records
-uv run lexcrawl crawl --source uae                                  # UAE news over plain HTTP
-uv run lexcrawl crawl --source uae --engine browser                 # UAE news with headless Chromium
+uv run lexcrawl crawl --source uae                                  # UAE news (browser engine by default)
+uv run lexcrawl crawl --source uae --engine http                   # force the plain HTTP engine for UAE
 uv run lexcrawl crawl --source uae --engine browser --headed        # watch the browser work
 uv run lexcrawl crawl --source all --max-pages 2                    # every registered source
 ```
@@ -207,13 +252,22 @@ Discovery is **budget-aware and incremental**, because Firecrawl credits are lim
     `/api/news` endpoint is **not** used for preflight: the audit found 99/112 known reports but no
     report newer than 2019, so it cannot detect newly published reports.
 
-> **Live-access limitation (measured 2026-11-03).** A plain-`httpx` probe of
+> **Access strategy and live limitation (re-verified 2026-11-05).** A plain-`httpx` probe of
 > `https://www.commerce.gov/data-and-reports/reports` (and `/robots.txt`) returns **HTTP 403
-> with a Cloudflare `Just a moment...` challenge** for this egress, so the cheap preflight
-> currently reports `check_failed` and makes **zero** Firecrawl calls. The code fails safe; it
-> does not substitute `/api/news`, spoof a browser, or launch a historical crawl. Live Commerce
-> ingestion needs an approved access path. This does not affect the Firecrawl listing/detail
-> flows, which are exercised by tests through a mocked provider.
+> with a Cloudflare `Just a moment...` challenge** for this egress. The cheap preflight therefore
+> reports `check_failed` and makes **zero** Firecrawl calls; the code fails safe and does not
+> substitute `/api/news`, spoof a browser, solve challenges, or launch a historical crawl.
+>
+> The supported acquisition path is the explicit `--bootstrap` flag, which **skips the preflight**
+> and acquires through Firecrawl (listings and details), reusing `FIRECRAWL_CACHE_DIR`. Measured
+> with a corrected transport: `check_outcome=new_data`, one report acquired with full
+> `TEXT-BEGIN` body text at a cost of one credit. Attachments still answer 403 and are recorded
+> as `access_blocked` with their original URL retained.
+>
+> **Recommended configuration for this environment:** run the worker from an egress that the
+> site permits for the daily incremental preflight, or schedule explicit `--bootstrap` runs when
+> Firecrawl credits allow. No client-side bypass is implemented or intended; the preflight
+> strategy is left unchanged by default.
 
 
 Historical acquisition requires the explicit `--bootstrap` flag; an empty database never triggers
@@ -353,17 +407,27 @@ around; the already-collected records were preserved, which is the intended part
 behaviour. The API host publishes no `robots.txt` (HTTP 404), so the allow-all fallback
 applies and is logged.
 
-**Primary news source (throttled).** The configured listing URL (`LISTINGS_URL`) answers
+**Primary news source (throttled).** The UAE source defaults to the **browser engine**
+(`UAE_CRAWL_ENGINE=browser`), because the configured listing URL (`LISTINGS_URL`) answers
 **HTTP 403** with a Cloudflare bot-protection page (*"Sorry, you have been blocked …"*,
-`server: cloudflare`, Ray ID) for the plain HTTP engine from this egress, and the same denial
-appears with headless Chromium on any path once the site's small per-session budget is spent.
-Static paths (`/robots.txt`, `/favicon.ico`) still answer 200. Measured behaviour on 2026-10-29 with one browser session and no identity rotation:
+`server: cloudflare`, Ray ID) for the plain HTTP engine from this egress; the browser engine
+gets the listing, while the same denial appears on detail paths once the site's small
+per-session budget is spent. Static paths (`/robots.txt`, `/favicon.ico`) still answer 200.
+Measured behaviour on 2026-10-29 with one browser session and no identity rotation:
 
 - Listing page: **HTTP 200, real content, 20 live articles discovered** (`?page=2` present).
 - Listing page: **HTTP 200, real content**, and all **20 cards parse** (title + date + URL for
   20/20, summary and image for 19/20). That metadata alone is stored for every article.
-- Detail pages: the first **2** paced requests returned 200; every request after that was
-  denied. Repeating the run reproduced the same small budget.
+- Detail pages: the first **1–2** paced requests returned 200; every request after that was
+  denied. The budget is small and variable — re-measured **2026-11-05**: listing 200, then
+  detail #1 returned 200 and detail #2 onward were denied.
+
+  **Rotation closes the gap (measured 2026-11-05).** With the rotating fetcher, a run over the
+  UAE listing automatically closed and reopened the browser session on every refusal and
+  continued to the end: **14 sessions**, listing **2/2** (`pagination_complete=True`),
+  **26 articles discovered and 26/26 detail pages collected** (every row carries a `TEXT-BEGIN`
+  body and content hash, no metadata-only rows), `status=success`, ~88 s. The effective
+  per-session budget is ~2 requests, which rotation turns into an uninterrupted crawl.
 - Result of the latest run: `status=partial_failure`, exit code 1, **20 rows stored** — 1 with
   `TEXT-BEGIN` body text and 19 as metadata-only rows carrying the Arabic title, date,
   canonical URL, summary, and image. Nothing was fabricated, no blocked page was treated as
@@ -390,6 +454,84 @@ docker run -d --name lexcrawl-postgres -p 5432:5432 lexcrawl-postgres:16
 uv run lexcrawl db upgrade && uv run lexcrawl db seed
 uv run lexcrawl crawl --source uae --persist
 ```
+
+## HTTP API
+
+A read-only FastAPI layer exposes the collected content (articles, reports, resources, sources,
+and crawl-run history) under `/api/v1`. It reuses the existing persistence layer and does not
+expose internal `documents` terminology. See [`docs/API.md`](docs/API.md) for the full reference
+and [`docs/QA_REPORT.md`](docs/QA_REPORT.md) for the QA report.
+
+```bash
+uv run uvicorn lexcrawl.api:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+- Swagger UI: <http://localhost:8000/docs>
+- ReDoc: <http://localhost:8000/redoc>
+- OpenAPI JSON: <http://localhost:8000/openapi.json>
+
+Key endpoints: `GET /api/v1/health`, `/ready`, `/sources`, `/articles`, `/reports`,
+`/resources`, `/crawl-runs`. List endpoints are paginated (`?limit=&offset=`) and filterable by
+source and publication date.
+
+Crawls can be triggered (asynchronously) with a bearer token:
+
+```bash
+MANUAL_TRIGGER_TOKEN=change-me uv run uvicorn lexcrawl.api:create_app --factory --port 8000
+curl -X POST http://localhost:8000/api/v1/crawl-runs \
+  -H "Authorization: Bearer change-me" -H "Content-Type: application/json" \
+  -d '{"source": "cba", "max_pages": 2}'      # -> 202 {id, status:"running", trigger_type:"api"}
+```
+
+The trigger returns `202` with a run id; poll `GET /api/v1/crawl-runs/{id}` for status.
+Concurrent runs for the same source return `409`; a missing/invalid token returns `401`.
+Triggered crawls execute in-process (not durable across restarts) and are intended for a single
+worker. See [`docs/API.md`](docs/API.md) for the full contract.
+
+Export the generated schema (FastAPI is the source of truth):
+
+```bash
+uv run python -c "import json; from lexcrawl.api import create_app; print(json.dumps(create_app().openapi(), indent=2))" > openapi.json
+```
+
+Run the API tests (they use the isolated `lexcrawl_test` database; skip when PostgreSQL is down):
+
+```bash
+uv run pytest tests/api
+```
+
+### Daily scheduling
+
+APScheduler runs one job at `SCHEDULE_DAILY_CRON` (default `0 3 * * *`) in
+`SCHEDULE_TIMEZONE` (default `UTC`), crawling **all three sources** through the same
+`CrawlExecutor` used by the API. Scheduled runs are recorded with `trigger_type="scheduled"`
+and share persistence, run lifecycle, and advisory-lock concurrency. Set
+`SCHEDULE_ENABLED=false` to disable it. Jobs use `max_instances=1` with coalescing, and an
+active crawl makes the scheduled run skip (logged) rather than overlap.
+
+### Retrieving content
+
+```bash
+curl "http://localhost:8000/api/v1/articles?source=cba_news_releases&limit=5"
+curl "http://localhost:8000/api/v1/articles/<id>"            # full TEXT-BEGIN body + localizations
+curl "http://localhost:8000/api/v1/reports?source=commerce_reports"
+curl "http://localhost:8000/api/v1/reports/<id>/resources"   # PDF metadata + original URL
+curl "http://localhost:8000/api/v1/resources/<id>"
+```
+
+Resources expose the original remote URL and extraction status; the API does not offer file
+downloads. Extracted text starts with `TEXT-BEGIN` and `content_hash` is its SHA-256 digest.
+A blocked attachment is reported honestly (`extraction_status` `access_blocked`/`failed`,
+`has_content=false`) with its URL retained.
+
+### Operational limits
+
+- **Single API worker.** Crawl execution is in-process and not durable across restarts; do not
+  run multiple API processes.
+- **Read endpoints are unauthenticated**; only `POST /crawl-runs` requires the bearer token.
+- **Commerce** is often refused by Cloudflare for plain HTTP; the API preflight then returns
+  `check_failed` with no credits. Historical acquisition stays a CLI operation:
+  `uv run lexcrawl crawl --source commerce --bootstrap --persist`.
 
 ## Development
 

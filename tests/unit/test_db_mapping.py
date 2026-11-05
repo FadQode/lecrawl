@@ -12,7 +12,9 @@ from lexcrawl.repositories.mapping import (
     DOCUMENT_ERROR_TYPE,
     EXTRACTION_STAGE,
     RESOURCE_ERROR_TYPE,
+    RUN_ERROR_STAGE,
     RUN_ERROR_TYPE,
+    classify_run_error,
     document_status,
     document_type,
     document_values,
@@ -160,16 +162,39 @@ def test_run_counters_use_documented_units() -> None:
 
 
 def test_run_error_payloads_are_redacted_and_bounded() -> None:
-    """### Run errors become generic, redacted error rows."""
+    """### Run errors are classified, redacted, and bounded."""
     result = ActorRunResult(
         source="commerce_reports",
-        errors=("fetch failed at https://x.test/a?api_key=SECRET", "x" * 5000),
+        errors=("article fetch failed at https://x.test/a?api_key=SECRET", "x" * 5000),
     )
     payloads = run_error_payloads(result)
-    assert [payload.error_type for payload in payloads] == [RUN_ERROR_TYPE, RUN_ERROR_TYPE]
+    assert [payload.error_type for payload in payloads] == ["fetch_error", RUN_ERROR_TYPE]
+    assert [payload.stage for payload in payloads] == ["fetch", RUN_ERROR_STAGE]
     assert "SECRET" not in payloads[0].message
     assert len(payloads[1].message) <= 2000
     assert run_error_payloads(ActorRunResult(source="s")) == []
+
+
+@pytest.mark.parametrize(
+    ("message", "stage", "error_type"),
+    [
+        ("article fetch failed at https://x/y: boom", "fetch", "fetch_error"),
+        ("listing fetch failed at https://x/y: boom", "fetch", "fetch_error"),
+        ("listing parse failed: boom", "parse", "parse_error"),
+        ("listing page 2 did not contain the report table", "parse", "parse_error"),
+        ("no article URLs discovered on the listing pages", "discovery", "discovery_error"),
+        ("listing range gap before page 2 (20 -> 45)", "discovery", "discovery_error"),
+        ("stopped after hitting max_pages=25", "discovery", "budget_error"),
+        ("resource access_blocked at https://x/a.pdf: blocked", "extract", "resource_error"),
+        ("pdf processing failed at https://x/a.pdf: boom", "extract", "resource_error"),
+        ("change detection requires persisted documents", "persistence", "persistence_error"),
+        ("unexpected actor phase failure: boom", "unknown", "actor_error"),
+        ("a message with no recognized phrasing", "unknown", "actor_error"),
+    ],
+)
+def test_classify_run_error_maps_known_phrasing(message: str, stage: str, error_type: str) -> None:
+    """### Known actor phrasing maps to the existing stage vocabulary; the rest stays generic."""
+    assert classify_run_error(message) == (stage, error_type)
 
 
 def test_error_summary_is_bounded_and_redacted() -> None:
