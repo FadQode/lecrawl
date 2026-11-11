@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import httpx
+import respx
+
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
+from lexcrawl.crawling.direct import DirectHtmlScraper
 from lexcrawl.crawling.firecrawl import FirecrawlError, ScrapedPage
 from lexcrawl.models.document import TEXT_BEGIN_MARKER
-from samples import UAE_LISTING_URL, UAE_PAGE_TWO_URL, uae_detail_html, uae_listing_html
+from samples import UAE_HOST, UAE_LISTING_URL, UAE_PAGE_TWO_URL, uae_detail_html, uae_listing_html
 
 DETAIL_1 = f"{UAE_LISTING_URL}/article-1"
 DETAIL_2 = f"{UAE_LISTING_URL}/article-2"
@@ -152,3 +156,37 @@ def test_actor_keeps_metadata_on_thin_detail() -> None:
     assert document.text is None
     assert document.published_at is not None  # filled from the listing card
     assert result.records_without_text == 1
+
+
+@respx.mock
+def test_actor_runs_over_direct_scraper() -> None:
+    """### The UAE actor acquires listing and detail directly, spending no provider credits."""
+    respx.get(UAE_LISTING_URL).mock(
+        return_value=httpx.Response(
+            200, content=uae_listing_html(cards=1, next_page=None), headers={"content-type": "text/html"}
+        )
+    )
+    respx.get(DETAIL_1).mock(
+        return_value=httpx.Response(200, content=uae_detail_html(), headers={"content-type": "text/html"})
+    )
+    scraper = DirectHtmlScraper(
+        user_agent="LexCrawl/0.1 (+contact)",
+        timeout_seconds=10,
+        retry_delay_seconds=0.0,
+        allowed_hosts=(UAE_HOST,),
+        sleep=lambda _seconds: None,
+    )
+    actor = UaeLegislationActor(
+        listing_url=UAE_LISTING_URL,
+        firecrawl=scraper,
+        max_pages=2,
+        max_detail_scrapes=5,
+        min_body_words=3,
+    )
+    result = actor.run(None)
+    scraper.close()
+
+    assert result.status == "success"
+    assert len(result.documents) == 1
+    assert result.documents[0].text is not None
+    assert result.provider_credits_used == 0

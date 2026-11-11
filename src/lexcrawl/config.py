@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     listings_url: str = ""
     listings_language: str = "ar"
     uae_max_detail_scrapes_per_run: int = Field(default=20, ge=0, le=500)
+    # $ UAE is fetched directly when it answers without a challenge, with Firecrawl as the fallback.$
+    uae_direct_fetch: bool = True
 
     releases_api_url: str = ""
     releases_site_url: str = ""

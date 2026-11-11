@@ -7,15 +7,18 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 import httpx
 
+from lexcrawl.crawling.scrape import ScrapedPage, ScrapeError, Scraper
 from lexcrawl.logging import get_logger
 
 LOGGER = get_logger(__name__)
+
+# $ The acquisition contract is provider-neutral; this module supplies the Firecrawl client.$
+FirecrawlError = ScrapeError
+FirecrawlScraper = Scraper
 
 DEFAULT_API_URL = "https://api.firecrawl.dev/v2/scrape"
 TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -23,40 +26,8 @@ PERMANENT_STATUS_CODES = frozenset({400, 401, 402, 403, 404, 422})
 MAX_BACKOFF_SECONDS = 30.0
 
 
-class FirecrawlError(RuntimeError):
-    """### Raised when a scrape cannot produce a usable result."""
-
-    def __init__(self, message: str, *, url: str, status_code: int | None = None, retryable: bool = False) -> None:
-        """### Record the failure with its target URL and HTTP status."""
-        super().__init__(message)
-        self.url = url
-        self.status_code = status_code
-        self.retryable = retryable
-
-
-class FirecrawlAuthError(FirecrawlError):
+class FirecrawlAuthError(ScrapeError):
     """### Raised when Firecrawl rejects the credentials or the plan."""
-
-
-@dataclass(frozen=True, slots=True)
-class ScrapedPage:
-    """### One successful Firecrawl scrape."""
-
-    requested_url: str
-    provider_status: int
-    target_status: int | None
-    html: str
-    markdown: str
-    credits_used: int
-    cached: bool = False
-
-
-class FirecrawlScraper(Protocol):
-    """### Minimal scraping interface the actor depends on."""
-
-    def scrape(self, url: str, *, cache: bool = False) -> ScrapedPage:
-        """### Scrape one URL or raise a `FirecrawlError`."""
-        ...
 
 
 class FirecrawlClient:

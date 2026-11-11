@@ -13,7 +13,7 @@ API, and scheduling are planned next.
 | --- | --- |
 | CBA news releases (HTTP → parse → canonical JSON) | Implemented |
 | Commerce reports (Firecrawl → parse → canonical JSON) | Implemented |
-| UAE Legislation news (Firecrawl → parse → canonical JSON) | Implemented |
+| UAE Legislation news (direct fetch → Firecrawl fallback → parse → canonical JSON) | Implemented |
 | PDF attachment extraction | Not started (attachment URLs captured as metadata) |
 | PostgreSQL persistence | Not started |
 | FastAPI + Swagger UI | Not started |
@@ -31,6 +31,9 @@ src/lexcrawl/
 ├── crawling/
 │   ├── base.py        # Fetcher protocol, FetchedPage, fetch errors, block detection
 │   ├── http.py        # httpx strategy: timeouts, bounded retries, pacing, redirect checks
+│   ├── scrape.py      # provider-neutral scraping contract (ScrapedPage, Scraper, errors)
+│   ├── direct.py      # direct HTML acquisition with navigation headers, fail closed on a challenge
+│   ├── fallback.py    # tries the direct path, falls back to Firecrawl only on a challenge
 │   └── firecrawl.py   # Firecrawl v2 scrape client (retries, pacing, response cache)
 ├── models/document.py # RawArticle, CanonicalDocument, DocumentResource, TEXT-BEGIN, hashing
 ├── pipeline/normalize.py  # shared whitespace and paragraph extraction
@@ -70,6 +73,17 @@ uv run pytest
 uv run ruff check .
 uv run mypy
 ```
+
+## Source access
+
+- CBA is fetched over plain HTTP (server-rendered pages and its listing feed).
+- Commerce is acquired through Firecrawl only: plain HTTP is refused with a Cloudflare challenge.
+- UAE is fetched **directly** with standard navigation headers (`Accept`, `Accept-Language`,
+  `Sec-Fetch-*`, `Upgrade-Insecure-Requests`) and the identifying user agent. Following the
+  AGENTS.md exception, this is allowed only while the source answers 200 with no challenge. Any
+  403 or challenge response **fails closed** to Firecrawl after a single same-request retry;
+  variations, fingerprint spoofing, and challenge solving are never attempted. Set
+  `UAE_DIRECT_FETCH=false` to use Firecrawl for UAE exclusively.
 
 ## Conventions
 

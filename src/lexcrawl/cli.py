@@ -14,8 +14,11 @@ from lexcrawl.actors.commerce import CommerceReportsActor
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
 from lexcrawl.config import Settings, get_settings
 from lexcrawl.crawling.base import Fetcher
+from lexcrawl.crawling.direct import DirectHtmlScraper
+from lexcrawl.crawling.fallback import FallbackScraper
 from lexcrawl.crawling.firecrawl import FirecrawlClient
 from lexcrawl.crawling.http import HttpFetcher
+from lexcrawl.crawling.scrape import Scraper
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
 
@@ -57,6 +60,28 @@ def build_firecrawl(settings: Settings) -> FirecrawlClient:
     )
 
 
+def uae_allowed_hosts(settings: Settings) -> tuple[str, ...]:
+    """### Allow direct fetches among the UAE listing host and its www alias."""
+    host = (urlparse(settings.listings_url).hostname or "").lower().rstrip(".")
+    if not host:
+        return ()
+    return tuple(sorted({host, host[4:] if host.startswith("www.") else f"www.{host}"}))
+
+
+def build_uae_scraper(settings: Settings) -> Scraper:
+    """### Build the UAE acquisition path: direct when unchallenged, Firecrawl as the fallback."""
+    firecrawl = build_firecrawl(settings)
+    if not settings.uae_direct_fetch:
+        return firecrawl
+    direct = DirectHtmlScraper(
+        user_agent=settings.crawl_user_agent,
+        timeout_seconds=settings.crawl_request_timeout_seconds,
+        retry_delay_seconds=settings.crawl_retry_backoff_seconds,
+        allowed_hosts=uae_allowed_hosts(settings),
+    )
+    return FallbackScraper(primary=direct, fallback=firecrawl)
+
+
 def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) -> Actor:
     """### Build one actor from CLI overrides and validated settings."""
     if name == "cba":
@@ -79,10 +104,10 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             min_body_words=settings.firecrawl_min_body_words,
         )
     if name == "uae":
-        # $ UAE listing and detail pages are both acquired through Firecrawl.$
+        # $ UAE is fetched directly when unchallenged; Firecrawl is the fail-closed fallback.$
         return UaeLegislationActor(
             listing_url=settings.listings_url,
-            firecrawl=build_firecrawl(settings),
+            firecrawl=build_uae_scraper(settings),
             max_pages=arguments.max_pages if arguments.max_pages is not None else settings.crawl_max_listing_pages,
             max_detail_scrapes=settings.uae_max_detail_scrapes_per_run,
             min_body_words=settings.firecrawl_min_body_words,
