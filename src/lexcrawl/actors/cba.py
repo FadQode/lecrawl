@@ -19,26 +19,10 @@ from lexcrawl.models.document import (
     ArticleContentError,
     ArticleStub,
     CanonicalDocument,
-    DocumentResource,
     DocumentStatus,
     RawArticle,
-    ResourceStatus,
-    compute_content_hash,
-    ensure_text_marker,
 )
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
-from lexcrawl.pipeline.pdf import PdfExtractionError, extract_pdf, is_pdf_content_type, resource_kind
-from lexcrawl.validation.cba import (
-    SOURCE_NAME as CONTRACT_SOURCE_NAME,
-)
-from lexcrawl.validation.cba import (
-    CbaNewsRelease,
-    CbaResource,
-    display_titles,
-    normalize_resource_type,
-    to_canonical,
-    validate_release,
-)
 
 LOGGER = get_logger(__name__)
 
@@ -54,14 +38,11 @@ DATE_SELECTOR = ".articleDateLogo"
 TOPIC_SELECTOR = "section.tags a"
 SUMMARY_SECTION_SELECTOR = "div.inline-summary"
 BODY_SELECTOR = "#section-to-print"
-SIDEBAR_SELECTOR = "div.sticky-sidebar"
-OVERLINE_SELECTOR = "div.overline"
-ADDITIONAL_INFORMATION_LABEL = "additional information"
 # $ These blocks are rendered separately, so they must not repeat inside the body text.$
-EXCLUDED_FROM_BODY = (SUMMARY_SECTION_SELECTOR, "section.tags", SIDEBAR_SELECTOR)
+EXCLUDED_FROM_BODY = (SUMMARY_SECTION_SELECTOR, "section.tags")
+_IMAGE_SELECTORS = ("div.articleHero img[src]", ".obscure-image img[src]", "picture img[src]")
 
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S")
-_IMAGE_SELECTORS = ("div.articleHero img[src]", ".obscure-image img[src]", "picture img[src]")
 
 
 class CbaApiError(ValueError):
@@ -154,12 +135,7 @@ def listing_request_body(*, language: str, page_size: int, skip: int) -> str:
     )
 
 
-def record_from_payload(
-    payload: dict[str, object],
-    *,
-    site_url: str,
-    article_path: str,
-) -> CbaRecord | None:
+def record_from_payload(payload: dict[str, object], *, site_url: str, article_path: str) -> CbaRecord | None:
     """### Convert one listing record into a contract record, or None when unusable."""
     slug = _first_text(payload.get("SEOName"))
     title = _first_text(payload.get("Title"))
@@ -180,13 +156,7 @@ def record_from_payload(
     )
 
 
-def parse_listing(
-    payload: bytes | str,
-    *,
-    api_url: str,
-    site_url: str,
-    article_path: str,
-) -> CbaListingPage:
+def parse_listing(payload: bytes | str, *, api_url: str, site_url: str, article_path: str) -> CbaListingPage:
     """### Parse one listing response into article records."""
     try:
         document = json.loads(payload)
@@ -250,7 +220,6 @@ def parse_article(
         image_url=_image_url_from_page(soup, url),
         type_of_law=text_of(soup.select_one(TYPE_SELECTOR)) or text_of(soup.select_one(TYPE_FALLBACK_SELECTOR)) or None,
         topics=article_topics(soup),
-        resources=additional_information(soup, url),
         paragraphs=paragraphs,
     )
 
@@ -284,36 +253,6 @@ def article_topics(soup: BeautifulSoup) -> tuple[str, ...]:
         if label and label not in topics:
             topics.append(label)
     return tuple(topics)
-
-
-def additional_information(soup: BeautifulSoup, url: str) -> tuple[DocumentResource, ...]:
-    """### Extract the Additional information resources with their formats."""
-    heading = _additional_information_heading(soup)
-    if heading is None:
-        return ()
-    resources: list[DocumentResource] = []
-    for anchor in heading.find_next_siblings():
-        if not isinstance(anchor, Tag):
-            continue
-        if anchor.name == OVERLINE_SELECTOR.split(".")[-1] or OVERLINE_SELECTOR.split(".")[-1] in (
-            anchor.get("class") or []
-        ):
-            break
-        for link in anchor.select("a[href]") if anchor.name != "a" else [anchor]:
-            href = link.get("href")
-            if not isinstance(href, str) or not href.strip():
-                continue
-            target = urljoin(url, href)
-            resources.append(DocumentResource(title=text_of(link) or target, url=target, kind=resource_kind(target)))
-    return tuple(resources)
-
-
-def _additional_information_heading(soup: BeautifulSoup) -> Tag | None:
-    """### Find the Additional information heading block."""
-    for heading in soup.select(OVERLINE_SELECTOR):
-        if ADDITIONAL_INFORMATION_LABEL in text_of(heading).lower():
-            return heading
-    return None
 
 
 def _image_url_from_page(soup: BeautifulSoup, url: str) -> str | None:
@@ -369,7 +308,6 @@ class CbaNewsReleasesActor(Actor):
     """### Collect CBA news releases through the listing feed and article pages."""
 
     name = SOURCE_NAME
-    requires_http_engine = True
 
     def __init__(
         self,
@@ -382,14 +320,11 @@ class CbaNewsReleasesActor(Actor):
         type_label: str = "News Releases",
         page_size: int = 50,
         max_pages: int = 10,
-        max_pdf_bytes: int = 26_214_400,
-        pdf_timeout_seconds: float = 60.0,
         source_name: str = SOURCE_NAME,
     ) -> None:
         """### Configure the listing feed and the enrichment bounds."""
         self.api_url = required_setting(api_url, name="RELEASES_API_URL")
         self.site_url = required_setting(site_url, name="RELEASES_SITE_URL")
-        # $ Article scope comes from the configured site so validation never names a domain.$
         self.article_host = article_scope(self.site_url)
         self.article_path = article_path
         self.type_label = type_label
@@ -397,8 +332,6 @@ class CbaNewsReleasesActor(Actor):
         self.type_guid = type_guid
         self.page_size = max(1, page_size)
         self.max_pages = max(1, max_pages)
-        self.max_pdf_bytes = max_pdf_bytes
-        self.pdf_timeout_seconds = pdf_timeout_seconds
         self.source_name = source_name
         self._logger = get_logger(f"{__name__}.{source_name}")
 
@@ -467,10 +400,7 @@ class CbaNewsReleasesActor(Actor):
         payload = listing_request_body(language=self.api_language, page_size=self.page_size, skip=skip)
         response = fetcher.post_json(self.api_url, payload=payload)
         return parse_listing(
-            response.content,
-            api_url=self.api_url,
-            site_url=self.site_url,
-            article_path=self.article_path,
+            response.content, api_url=self.api_url, site_url=self.site_url, article_path=self.article_path
         )
 
     def _enrich(self, fetcher: Fetcher, state: _RunState, result: ActorRunResult) -> None:
@@ -480,17 +410,10 @@ class CbaNewsReleasesActor(Actor):
             return
         for record in state.discovered.values():
             result.detail_pages_attempted += 1
-            try:
-                self._enrich_record(fetcher, record, result)
-            except Exception as error:
-                self._logger.exception("release_materialization_failed", extra={"url": record.url})
-                result.detail_pages_failed += 1
-                result.records_missing_required_fields += 1
-                result.add_error(f"release materialization failed at {record.url}: {error!r}")
-                result.documents.append(self._metadata_only(record, result, error=repr(error)))
+            self._enrich_record(fetcher, record, result)
 
     def _enrich_record(self, fetcher: Fetcher, record: CbaRecord, result: ActorRunResult) -> None:
-        """### Fetch, validate and canonicalize one release without affecting siblings."""
+        """### Fetch, parse and canonicalize one release without affecting siblings."""
         try:
             page = fetcher.fetch(record.url)
             article = parse_article(page.content, record.url)
@@ -514,23 +437,14 @@ class CbaNewsReleasesActor(Actor):
             return
 
         self._apply_listing_fallbacks(article, record)
-        release = self._build_release(fetcher, article, record, result)
-        validation = validate_release(release, expected_host=self.article_host)
-        for issue in validation.article.errors:
-            result.add_error(f"{record.url} {issue.field} {issue.code}: {issue.message}")
-        for issue in validation.article.warnings:
-            self._logger.warning("release_warning", extra={"url": record.url, "code": issue.code})
-        for index, report in enumerate(validation.resources):
-            for issue in report.errors:
-                result.add_error(f"{record.url} resources.{index} {issue.code}: {issue.message}")
-            for issue in report.warnings:
-                self._logger.warning("resource_warning", extra={"url": record.url, "index": index, "code": issue.code})
-        if not validation.ok:
-            # $ A release that fails article validation keeps only its discovery metadata.$
+        try:
+            document = CanonicalDocument.from_raw(article)
+        except ValueError as error:
+            # $ A release that fails the canonical contract keeps only its discovery metadata.$
             result.records_missing_required_fields += 1
+            result.add_error(f"article validation failed at {record.url}: {error}")
             result.documents.append(self._metadata_only(record, result))
             return
-        document = to_canonical(release)
         result.detail_pages_succeeded += 1
         result.documents.append(document)
 
@@ -553,7 +467,7 @@ class CbaNewsReleasesActor(Actor):
     ) -> CanonicalDocument:
         """### Store discovery metadata for an article that could not be enriched."""
         result.records_without_text += 1
-        document = CanonicalDocument.from_listing_entry(
+        return CanonicalDocument.from_listing_entry(
             ArticleStub(
                 url=record.url,
                 title=record.title,
@@ -567,141 +481,4 @@ class CbaNewsReleasesActor(Actor):
             native_id=record.slug,
             extraction_status=status,
             extraction_error=error,
-        )
-        return document
-
-    def _build_release(
-        self,
-        fetcher: Fetcher,
-        article: RawArticle,
-        record: CbaRecord,
-        result: ActorRunResult,
-    ) -> CbaNewsRelease:
-        """### Build the source contract from the parsed page and its resources."""
-        marked_text = ensure_text_marker(article.text) if article.text.strip() else None
-        return CbaNewsRelease(
-            source=CONTRACT_SOURCE_NAME,
-            source_url=record.url,
-            title=article.title,
-            native_id=record.slug,
-            published_at=article.published_at,
-            topics=article.topics,
-            summary=article.summary,
-            text=marked_text,
-            content_hash=compute_content_hash(marked_text) if marked_text else None,
-            image_url=article.image_url,
-            resources=self._collect_resources(fetcher, article, result),
-        )
-
-    def _collect_resources(
-        self,
-        fetcher: Fetcher,
-        article: RawArticle,
-        result: ActorRunResult,
-    ) -> tuple[CbaResource, ...]:
-        """### Collect every attached resource, de-duplicating repeated links."""
-        unique: dict[str, DocumentResource] = {}
-        for resource in article.resources:
-            key = resource.url or f"title:{resource.title}"
-            if key in unique:
-                self._logger.info("resource_deduplicated", extra={"url": resource.url, "title": resource.title})
-                continue
-            unique[key] = resource
-        result.discover_resources(len(unique))
-        collected_items = []
-        for resource in unique.values():
-            processed = self._resource_from(fetcher, resource, result)
-            result.account_resource(processed.extraction_status)
-            if processed.extraction_status == "url_unavailable":
-                result.add_error(f"resource URL unavailable: {processed.title}")
-            collected_items.append(processed)
-        collected = tuple(collected_items)
-        return display_titles(collected)
-
-    def _resource_from(
-        self,
-        fetcher: Fetcher,
-        resource: DocumentResource,
-        result: ActorRunResult,
-    ) -> CbaResource:
-        """### Process one attachment, recording its own extraction outcome."""
-        kind = normalize_resource_type(resource.kind)
-        if resource.url is None:
-            return CbaResource(
-                title=resource.title,
-                original_url=None,
-                resource_type=kind,
-                extraction_status="url_unavailable",
-                error="resource URL is not available",
-            )
-        if kind != "pdf":
-            # $ Non-PDF attachments are preserved as metadata, never extracted as PDFs.$
-            return CbaResource(
-                title=resource.title,
-                original_url=resource.url,
-                resource_type=kind,
-                extraction_status="not_applicable",
-            )
-        try:
-            page = fetcher.fetch_binary(resource.url, max_bytes=self.max_pdf_bytes)
-            if page.status_code is not None and not 200 <= page.status_code < 300:
-                raise FetchError(
-                    "PDF response returned an unsuccessful HTTP status",
-                    url=resource.url,
-                    status_code=page.status_code,
-                )
-            if not is_pdf_content_type(page.content_type):
-                raise PdfExtractionError("response content type is not PDF")
-            extraction = extract_pdf(
-                page.content,
-                max_bytes=self.max_pdf_bytes,
-                timeout_seconds=self.pdf_timeout_seconds,
-            )
-        except (AccessBlockedError, AccessDeniedError) as error:
-            return self._failed_resource(resource, "access_blocked", str(error), result)
-        except PdfExtractionError as error:
-            return self._failed_resource(resource, "failed", str(error), result)
-        except FetchError as error:
-            status: ResourceStatus = (
-                "url_unavailable" if getattr(error, "status_code", None) in {404, 410} else "failed"
-            )
-            return self._failed_resource(resource, status, str(error), result)
-        if extraction.extracted_text is None:
-            return self._failed_resource(
-                resource,
-                "failed",
-                extraction.error_message or "PDF extraction failed",
-                result,
-            )
-
-        return CbaResource(
-            title=resource.title,
-            original_url=resource.url,
-            resource_type="pdf",
-            mime_type=page.content_type or "application/pdf",
-            file_size=len(page.content),
-            extracted_text=extraction.extracted_text,
-            content_hash=extraction.content_hash,
-            page_count=extraction.page_count,
-            character_count=extraction.character_count,
-            extraction_status="complete",
-        )
-
-    def _failed_resource(
-        self,
-        resource: DocumentResource,
-        status: ResourceStatus,
-        message: str,
-        result: ActorRunResult,
-    ) -> CbaResource:
-        """### Record a resource failure without touching the parent article."""
-        result.add_error(f"pdf processing failed at {resource.url}: {message}")
-        return CbaResource.model_validate(
-            {
-                "title": resource.title,
-                "original_url": resource.url,
-                "resource_type": "pdf",
-                "extraction_status": status,
-                "error": message,
-            }
         )

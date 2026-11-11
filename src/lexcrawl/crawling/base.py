@@ -66,10 +66,6 @@ class AccessDeniedError(FetchError):
     """### An ordinary HTTP authorization denial, distinct from bot protection."""
 
 
-class RobotsDisallowedError(FetchError):
-    """### The published robots policy does not allow fetching this URL."""
-
-
 @runtime_checkable
 class Fetcher(Protocol):
     """### Minimal fetching interface every crawling strategy satisfies."""
@@ -80,7 +76,7 @@ class Fetcher(Protocol):
         ...
 
     def fetch(self, url: str) -> FetchedPage:
-        """### Retrieve one URL or raise a `FetchError`."""
+        """### Retrieve one URL as a textual page or raise a `FetchError`."""
         ...
 
     def fetch_binary(self, url: str, *, max_bytes: int | None = None) -> FetchedPage:
@@ -99,7 +95,7 @@ class Fetcher(Protocol):
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 BOT_BLOCK_STATUS_CODES = frozenset({403, 503})
 
-# $ Markers emitted by Cloudflare bot protection when a request is denied.$
+# $ Markers emitted by common bot protection when a request is denied.$
 BOT_BLOCK_MARKERS = (
     b"Attention Required! | Cloudflare",
     b"you have been blocked",
@@ -130,13 +126,8 @@ def redact_url(url: str) -> str:
     return urlunparse(parts._replace(query=urlencode(query)))
 
 
-def validate_http_url(
-    url: str,
-    *,
-    allowed_hosts: tuple[str, ...] = (),
-    allow_private_hosts: tuple[str, ...] = (),
-) -> str:
-    """### Validate a request destination and optional hostname allowlist."""
+def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
+    """### Validate a request destination and an optional hostname allowlist."""
     parts = urlparse(url)
     host = (parts.hostname or "").lower().rstrip(".")
     if parts.scheme not in {"http", "https"} or not host or parts.username or parts.password:
@@ -147,8 +138,7 @@ def validate_http_url(
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
-    permitted_private = {value.lower().rstrip(".") for value in allow_private_hosts}
-    if address is not None and not address.is_global and host not in permitted_private:
+    if address is not None and not address.is_global:
         raise FetchError("non-public IP destinations are not allowed", url=url)
     if allowed_hosts:
         permitted = {value.lower().rstrip(".") for value in allowed_hosts}

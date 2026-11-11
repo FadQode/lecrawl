@@ -7,22 +7,13 @@ requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }
 authors = [{ name = "LexCrawl" }]
 dependencies = [
-    "fastapi>=0.115,<1.0",
-    "uvicorn[standard]>=0.34,<1.0",
     "pydantic>=2.10,<3.0",
     "pydantic-settings>=2.7,<3.0",
     "python-dotenv>=1.0,<2.0",
-    "SQLAlchemy>=2.0,<3.0",
-    "psycopg[binary]>=3.2,<4.0",
-    "alembic>=1.14,<2.0",
     "httpx>=0.28,<1.0",
     "beautifulsoup4>=4.12,<5.0",
     "lxml>=5.3,<7.0",
-    "playwright>=1.50,<2.0",
-    "PyMuPDF>=1.25,<2.0",
     "tenacity>=9.0,<10.0",
-    "APScheduler>=3.11,<4.0",
-    "requests>=2.34.2",
 ]
 
 [project.scripts]
@@ -31,9 +22,7 @@ lexcrawl = "lexcrawl.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9.0",
-    "pytest-asyncio>=0.25,<2.0",
     "respx>=0.22,<1.0",
-    "coverage[toml]>=7.6,<8.0",
     "ruff>=0.9,<1.0",
     "mypy>=1.13,<2.0",
 ]
@@ -59,10 +48,6 @@ extend-exclude = [".agents", ".claude", ".grok", ".kilo", "migrations"]
 select = ["E", "F", "I", "B", "UP", "SIM", "PTH", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
-[tool.ruff.lint.per-file-ignores]
-# $ Alembic imports the model modules for their side effect of registering tables.$
-"migrations/env.py" = ["F401"]
-
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -70,26 +55,14 @@ mypy_path = "src"
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["bs4.*", "lxml.*", "fitz.*", "pymupdf.*", "apscheduler.*"]
+module = ["bs4.*", "lxml.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["lexcrawl.pipeline.pdf"]
-disallow_untyped_calls = false
-
-[tool.coverage.run]
-source = ["src/lexcrawl"]
-branch = true
-
-[tool.coverage.report]
-show_missing = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 addopts = "-q --strict-markers"
 markers = [
-    "integration: requires a live PostgreSQL database",
     "live: requires network access to the target source",
 ]

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -23,9 +26,6 @@ from lexcrawl.crawling.base import (
     redact_url,
     validate_http_url,
 )
-from lexcrawl.crawling.pacing import RequestPacer
-from lexcrawl.crawling.retry import parse_retry_after, retry_delay
-from lexcrawl.crawling.robots import RobotsFile, RobotsPolicy
 from lexcrawl.logging import get_logger
 
 # $ Textual payloads: HTML pages and the JSON/XML APIs that API sources consume.$
@@ -59,8 +59,57 @@ if not any(isinstance(item, _RedactHttpxRequestUrls) for item in _httpx_logger.f
     _httpx_logger.addFilter(_RedactHttpxRequestUrls())
 
 
+def parse_retry_after(value: str | None) -> float | None:
+    """### Parse a `Retry-After` header into a bounded number of seconds."""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        pass
+    else:
+        return max(0.0, seconds)
+    try:
+        target = parsedate_to_datetime(value.strip())
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return max(0.0, (target - datetime.now(tz=UTC)).total_seconds())
+
+
+def retry_delay(attempt: int, *, backoff_seconds: float, retry_after_seconds: float | None = None) -> float:
+    """### Choose a jittered backoff, honouring a server-directed hint when present."""
+    if retry_after_seconds is not None:
+        return min(retry_after_seconds, 60.0)
+    base = backoff_seconds * (2.0 ** max(0, attempt - 1))
+    return min(base * (1 + random.random() * 0.25), 60.0)
+
+
+class RequestPacer:
+    """### Enforce a minimum delay between successive outgoing requests."""
+
+    def __init__(self, delay_seconds: float, *, sleep: Callable[[float], None], monotonic: Callable[[], float]) -> None:
+        """### Store the pacing delay and injectable clock."""
+        self._delay_seconds = max(0.0, delay_seconds)
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last_request_at: float | None = None
+
+    def wait_for_slot(self) -> None:
+        """### Sleep just long enough to honour the configured request spacing."""
+        if self._delay_seconds <= 0:
+            return
+        now = self._monotonic()
+        if self._last_request_at is not None:
+            remaining = self._delay_seconds - (now - self._last_request_at)
+            if remaining > 0:
+                self._sleep(remaining)
+        self._last_request_at = self._monotonic()
+
+
 class HttpFetcher:
-    """### Fetch pages over HTTP while respecting timeouts, pacing, and robots."""
+    """### Fetch pages over HTTP while respecting timeouts, pacing, and bounded retries."""
 
     engine_name = "http"
 
@@ -72,7 +121,6 @@ class HttpFetcher:
         max_retries: int = 3,
         backoff_seconds: float = 1.5,
         request_delay_seconds: float = 0.0,
-        respect_robots_txt: bool = True,
         max_response_bytes: int = 26_214_400,
         allowed_redirect_hosts: tuple[str, ...] = (),
         max_redirects: int = 5,
@@ -85,7 +133,6 @@ class HttpFetcher:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._backoff_seconds = backoff_seconds
-        self._respect_robots_txt = respect_robots_txt
         self._max_response_bytes = max(1, max_response_bytes)
         self._allowed_redirect_hosts = tuple(host.lower().rstrip(".") for host in allowed_redirect_hosts)
         self._max_redirects = max(0, max_redirects)
@@ -105,13 +152,6 @@ class HttpFetcher:
             },
         )
         self._owns_client = client is None
-        self._robots = RobotsPolicy(
-            self._read_robots_file,
-            user_agent=user_agent,
-            max_retries=max_retries,
-            backoff_seconds=backoff_seconds,
-            sleep=sleep,
-        )
 
     def close(self) -> None:
         """### Release the underlying HTTP connection pool."""
@@ -136,36 +176,7 @@ class HttpFetcher:
 
     def post_json(self, url: str, *, payload: str) -> FetchedPage:
         """### Send a JSON body to one URL and return the response page."""
-        if self._respect_robots_txt:
-            self._robots.assert_allowed(url)
-        return self._post_once_with_retries(url, payload=payload)
-
-    def _post_once_with_retries(self, url: str, *, payload: str) -> FetchedPage:
-        """### Post a payload with bounded retries for transient failures."""
-
-        def wait(retry_state: object) -> float:
-            """### Choose jittered backoff while honoring a server retry hint."""
-            attempt = getattr(retry_state, "attempt_number", 1)
-            outcome = getattr(retry_state, "outcome", None)
-            error = outcome.exception() if outcome is not None else None
-            retry_after = error.retry_after_seconds if isinstance(error, TransientFetchError) else None
-            return retry_delay(attempt, backoff_seconds=self._backoff_seconds, retry_after_seconds=retry_after)
-
-        retryer = Retrying(
-            retry=retry_if_exception_type(TransientFetchError),
-            stop=stop_after_attempt(self._max_retries + 1),
-            wait=wait,
-            sleep=self._sleep,
-            reraise=True,
-        )
-        for attempt in retryer:
-            with attempt:
-                return self._post(url, payload=payload)
-        raise TransientFetchError("retry loop exhausted without a response", url=url)
-
-    def _post(self, url: str, *, payload: str) -> FetchedPage:
-        """### Issue a single paced POST request and translate its outcome."""
-        return self._request_streamed(
+        return self._request_with_retries(
             "POST",
             url,
             require_text=True,
@@ -175,21 +186,28 @@ class HttpFetcher:
         )
 
     def _fetch_cached(self, url: str, *, require_text: bool, max_bytes: int | None = None) -> FetchedPage:
-        """### Fetch a URL once per run, applying robots and retry policy."""
+        """### Fetch a URL once per run, applying the retry policy."""
         limit = min(max_bytes, self._max_response_bytes) if max_bytes is not None else self._max_response_bytes
         cache_key = (url, require_text, limit)
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._logger.debug("fetch_cache_hit", extra={"url": redact_url(validate_http_url(url))})
             return cached
-        if self._respect_robots_txt:
-            self._robots.assert_allowed(url)
-        page = self._fetch_once_with_retries(url, require_text=require_text, max_bytes=limit)
+        page = self._request_with_retries("GET", url, require_text=require_text, max_bytes=limit)
         self._cache[cache_key] = page
         return page
 
-    def _fetch_once_with_retries(self, url: str, *, require_text: bool = True, max_bytes: int) -> FetchedPage:
-        """### Perform the request with bounded retries for transient failures."""
+    def _request_with_retries(
+        self,
+        method: str,
+        url: str,
+        *,
+        require_text: bool,
+        max_bytes: int,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> FetchedPage:
+        """### Perform a request with bounded retries for transient failures."""
 
         def wait(retry_state: object) -> float:
             """### Choose jittered backoff while honoring a server retry hint."""
@@ -208,7 +226,14 @@ class HttpFetcher:
         )
         for attempt in retryer:
             with attempt:
-                return self._request_streamed("GET", url, require_text=require_text, max_bytes=max_bytes)
+                return self._request_streamed(
+                    method,
+                    url,
+                    require_text=require_text,
+                    max_bytes=max_bytes,
+                    content=content,
+                    headers=headers,
+                )
         raise TransientFetchError("retry loop exhausted without a response", url=url)
 
     def _request_streamed(
@@ -348,18 +373,3 @@ class HttpFetcher:
             content=response.content,
             content_type=content_type,
         )
-
-    def _read_robots_file(self, robots_url: str) -> RobotsFile:
-        """### Retrieve a host's robots.txt through the HTTP client."""
-        try:
-            page = self._request_streamed(
-                "GET", robots_url, require_text=True, max_bytes=min(self._max_response_bytes, 512_000)
-            )
-        except FetchError as error:
-            return RobotsFile(
-                status_code=error.status_code,
-                error=str(error),
-                retry_after_seconds=getattr(error, "retry_after_seconds", None),
-            )
-        text = page.content.decode("utf-8-sig", errors="replace") if page.status_code == 200 else None
-        return RobotsFile(status_code=page.status_code, text=text)

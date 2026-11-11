@@ -40,14 +40,3 @@ def _block_text(block: Tag) -> str:
     for nested_block in copied_block.find_all(_BLOCK_TAGS):
         nested_block.decompose()
     return text_of(copied_block)
-
-
-def paragraphs_from_html(fragment: str | bytes | None) -> list[str]:
-    """### Extract paragraph text from an HTML fragment or document."""
-    if not fragment:
-        return []
-    soup = BeautifulSoup(fragment, "lxml")
-    for ignored in soup.find_all(("script", "style", "noscript", "template")):
-        ignored.decompose()
-    body = soup.body or soup
-    return paragraphs_of(body)

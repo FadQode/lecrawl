@@ -46,23 +46,15 @@ class CrawlRunReport:
                     "source": result.source,
                     "status": result.status,
                     "documents": len(result.documents),
-                    "listing_pages_attempted": result.listing_pages_attempted,
                     "listing_pages_succeeded": result.listing_pages_succeeded,
-                    "listing_pages_failed": result.listing_pages_failed,
+                    "listing_pages_attempted": result.listing_pages_attempted,
                     "articles_discovered": result.articles_discovered,
                     "article_urls_deduplicated": result.article_urls_deduplicated,
                     "records_filtered_out": result.records_filtered_out,
-                    "detail_pages_attempted": result.detail_pages_attempted,
                     "detail_pages_succeeded": result.detail_pages_succeeded,
-                    "detail_pages_failed": result.detail_pages_failed,
+                    "detail_pages_attempted": result.detail_pages_attempted,
                     "records_missing_required_fields": result.records_missing_required_fields,
                     "records_without_text": result.records_without_text,
-                    "resources_discovered": result.resources_discovered,
-                    "resources_processed": result.resources_processed,
-                    "resources_extracted": result.resources_extracted,
-                    "resources_unavailable": result.resources_unavailable,
-                    "resources_failed": result.resources_failed,
-                    "resources_skipped": result.resources_skipped,
                     "pagination_complete": result.pagination_complete,
                     "duration_seconds": round(result.duration_seconds, 3),
                     "errors": list(result.errors),
@@ -79,15 +71,6 @@ def run_crawl(actors: list[Actor], fetcher: Fetcher) -> CrawlRunReport:
     report = CrawlRunReport()
     for actor in actors:
         logger.info("actor_run_started", extra={"source": actor.name, "engine": fetcher.engine_name})
-        if actor.requires_http_engine and fetcher.engine_name != "http":
-            # $ API sources consume raw payloads, which a rendering engine cannot deliver.$
-            report.results.append(
-                ActorRunResult(
-                    source=actor.name,
-                    errors=[f"source {actor.name} needs the http engine, not {fetcher.engine_name}; skipped"],
-                )
-            )
-            continue
         try:
             result = actor.run(fetcher)
         except Exception as error:  # $ Boundary: an unexpected actor failure is reported, never swallowed.$
