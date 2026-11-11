@@ -15,7 +15,35 @@ TEXT_BEGIN_MARKER = "TEXT-BEGIN"
 # $ How far a document's text extraction got, shared by every source.$
 DocumentStatus = Literal["pending", "complete", "failed", "access_blocked", "unavailable"]
 
+# $ Extraction state shared by every linked resource, across sources.$
+ResourceKind = Literal["pdf", "excel", "word", "csv", "other"]
+ResourceStatus = Literal["pending", "complete", "not_applicable", "access_blocked", "failed", "url_unavailable"]
+
+# $ How precisely a source states a publication date.$
+PublicationPrecision = Literal["day", "month", "year"]
+
+MIN_YEAR = 1800
+MAX_YEAR = 2100
+
 _LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
+def _check_date_precision(
+    *,
+    published_at: date | None,
+    published_month: int | None,
+    published_year: int | None,
+    published_precision: PublicationPrecision | None,
+) -> None:
+    """### Enforce the publication-date precision contract shared by documents."""
+    if published_precision == "day" and published_at is None:
+        raise ValueError("day precision requires published_at")
+    if published_precision == "month" and (published_month is None or published_year is None):
+        raise ValueError("month precision requires published_month and published_year")
+    if published_precision == "year" and published_year is None:
+        raise ValueError("year precision requires published_year")
+    if published_month is not None and published_year is None:
+        raise ValueError("published_month requires published_year")
 
 
 class ArticleContentError(ValueError):
@@ -58,6 +86,42 @@ class ArticleStub(BaseModel):
     image_url: str | None = None
 
 
+class DocumentResource(BaseModel):
+    """### One linked resource attached to a collected document."""
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str
+    url: str | None = None
+    kind: ResourceKind = "other"
+    status: ResourceStatus = "pending"
+    text: str | None = None
+    content_hash: str | None = None
+    error: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def _mark_collected_text(cls, value: str | None) -> str | None:
+        """### Ensure extracted resource text carries the required marker."""
+        if value is None or not value.strip():
+            return None
+        return ensure_text_marker(value)
+
+    @model_validator(mode="after")
+    def _check_resource_contract(self) -> DocumentResource:
+        """### Enforce resource status, URL, text, and hash consistency."""
+        if self.url is None and self.status != "url_unavailable":
+            raise ValueError("a resource without a URL must be marked url_unavailable")
+        if self.status == "complete":
+            if self.text is None or self.content_hash is None:
+                raise ValueError("complete resources require text and content hash")
+            if compute_content_hash(self.text) != self.content_hash:
+                raise ValueError("resource content hash does not match text")
+        elif self.text is not None or self.content_hash is not None:
+            raise ValueError("non-complete resources must not carry text or content hash")
+        return self
+
+
 class RawArticle(BaseModel):
     """### Actor output for one article, before canonicalization."""
 
@@ -66,10 +130,15 @@ class RawArticle(BaseModel):
     title: str
     language: str
     published_at: date | None = None
+    published_month: int | None = Field(default=None, ge=1, le=12)
+    published_year: int | None = Field(default=None, ge=MIN_YEAR, le=MAX_YEAR)
+    published_date_raw: str | None = None
+    published_precision: PublicationPrecision | None = None
     summary: str | None = None
     image_url: str | None = None
     type_of_law: str | None = None
     topics: tuple[str, ...] = ()
+    resources: tuple[DocumentResource, ...] = ()
     paragraphs: list[str] = Field(default_factory=list)
 
     @field_validator("title", "url")
@@ -102,10 +171,15 @@ class CanonicalDocument(BaseModel):
     text: str | None = None
     content_hash: str | None = None
     published_at: date | None = None
+    published_month: int | None = Field(default=None, ge=1, le=12)
+    published_year: int | None = Field(default=None, ge=MIN_YEAR, le=MAX_YEAR)
+    published_date_raw: str | None = None
+    published_precision: PublicationPrecision | None = None
     summary: str | None = None
     image_url: str | None = None
     type_of_law: str | None = None
     topics: tuple[str, ...] = ()
+    resources: tuple[DocumentResource, ...] = ()
 
     @model_validator(mode="after")
     def _check_canonical_contract(self) -> CanonicalDocument:
@@ -134,6 +208,12 @@ class CanonicalDocument(BaseModel):
                 raise ValueError("canonical content hash does not match text")
             if self.extraction_status not in {None, "complete"}:
                 raise ValueError("incomplete canonical documents must not carry text")
+        _check_date_precision(
+            published_at=self.published_at,
+            published_month=self.published_month,
+            published_year=self.published_year,
+            published_precision=self.published_precision,
+        )
         return self
 
     @classmethod
@@ -149,10 +229,15 @@ class CanonicalDocument(BaseModel):
             content_hash=compute_content_hash(body) if body is not None else None,
             extraction_status="complete" if body is not None else "pending",
             published_at=raw.published_at,
+            published_month=raw.published_month,
+            published_year=raw.published_year,
+            published_date_raw=raw.published_date_raw,
+            published_precision=raw.published_precision,
             summary=raw.summary,
             image_url=raw.image_url,
             type_of_law=raw.type_of_law,
             topics=raw.topics,
+            resources=raw.resources,
         )
 
     @classmethod
@@ -166,6 +251,11 @@ class CanonicalDocument(BaseModel):
         native_id: str | None = None,
         extraction_status: DocumentStatus = "pending",
         extraction_error: str | None = None,
+        published_month: int | None = None,
+        published_year: int | None = None,
+        published_date_raw: str | None = None,
+        published_precision: PublicationPrecision | None = None,
+        resources: tuple[DocumentResource, ...] = (),
     ) -> CanonicalDocument:
         """### Store discovery metadata for an article whose text is not collected yet."""
         return cls(
@@ -177,7 +267,12 @@ class CanonicalDocument(BaseModel):
             extraction_status=extraction_status,
             extraction_error=extraction_error,
             published_at=entry.published_at,
+            published_month=published_month,
+            published_year=published_year,
+            published_date_raw=published_date_raw,
+            published_precision=published_precision,
             summary=entry.summary,
             image_url=entry.image_url,
             type_of_law=type_of_law,
+            resources=resources,
         )

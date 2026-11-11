@@ -10,15 +10,18 @@ from urllib.parse import urlparse
 
 from lexcrawl.actors.base import Actor
 from lexcrawl.actors.cba import CbaNewsReleasesActor
+from lexcrawl.actors.commerce import CommerceReportsActor
+from lexcrawl.actors.uae_legislation import UaeLegislationActor
 from lexcrawl.config import Settings, get_settings
 from lexcrawl.crawling.base import Fetcher
+from lexcrawl.crawling.firecrawl import FirecrawlClient
 from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
 
 LOG = get_logger(__name__)
 
-SOURCE_NAMES = ("cba",)
+SOURCE_NAMES = ("uae", "commerce", "cba")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_firecrawl(settings: Settings) -> FirecrawlClient:
+    """### Build the Firecrawl scraper from validated settings."""
+    return FirecrawlClient(
+        api_key=settings.firecrawl_api_key,
+        api_url=settings.firecrawl_api_url,
+        timeout_seconds=settings.firecrawl_timeout_seconds,
+        max_retries=settings.firecrawl_max_retries,
+        request_delay_seconds=settings.firecrawl_request_delay_seconds,
+        cache_dir=settings.firecrawl_cache_dir or None,
+    )
+
+
 def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) -> Actor:
     """### Build one actor from CLI overrides and validated settings."""
     if name == "cba":
@@ -53,6 +68,24 @@ def build_actor(name: str, arguments: argparse.Namespace, settings: Settings) ->
             article_path=settings.releases_article_path,
             page_size=settings.releases_page_size,
             max_pages=arguments.max_pages if arguments.max_pages is not None else settings.releases_max_pages,
+        )
+    if name == "commerce":
+        # $ Commerce reports are acquired through Firecrawl, bounded by explicit budgets.$
+        return CommerceReportsActor(
+            listing_url=settings.reports_listing_url,
+            firecrawl=build_firecrawl(settings),
+            max_pages=arguments.max_pages if arguments.max_pages is not None else settings.firecrawl_max_pages_per_run,
+            max_detail_scrapes=settings.firecrawl_max_detail_scrapes_per_run,
+            min_body_words=settings.firecrawl_min_body_words,
+        )
+    if name == "uae":
+        # $ UAE listing and detail pages are both acquired through Firecrawl.$
+        return UaeLegislationActor(
+            listing_url=settings.listings_url,
+            firecrawl=build_firecrawl(settings),
+            max_pages=arguments.max_pages if arguments.max_pages is not None else settings.crawl_max_listing_pages,
+            max_detail_scrapes=settings.uae_max_detail_scrapes_per_run,
+            min_body_words=settings.firecrawl_min_body_words,
         )
     raise ValueError(f"unknown source {name!r}")
 

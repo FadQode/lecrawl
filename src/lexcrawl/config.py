@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     crawl_max_response_bytes: int = Field(default=26_214_400, gt=0)
 
     # $ Source locations come from the environment, so the repository names no live site.$
+    listings_url: str = ""
+    listings_language: str = "ar"
+    uae_max_detail_scrapes_per_run: int = Field(default=20, ge=0, le=500)
+
     releases_api_url: str = ""
     releases_site_url: str = ""
     releases_article_path: str = "/article/"
@@ -40,6 +44,18 @@ class Settings(BaseSettings):
     releases_api_language: str = "en-us"
     releases_page_size: int = Field(default=50, ge=1, le=200)
     releases_max_pages: int = Field(default=10, ge=1)
+
+    # $ Commerce reports are acquired through Firecrawl, which is budget-limited.$
+    reports_listing_url: str = ""
+    firecrawl_api_key: str = ""
+    firecrawl_api_url: str = "https://api.firecrawl.dev/v2/scrape"
+    firecrawl_timeout_seconds: float = Field(default=90.0, gt=0)
+    firecrawl_max_retries: int = Field(default=2, ge=0, le=5)
+    firecrawl_request_delay_seconds: float = Field(default=1.5, ge=0, le=60)
+    firecrawl_max_pages_per_run: int = Field(default=6, ge=1, le=50)
+    firecrawl_max_detail_scrapes_per_run: int = Field(default=20, ge=0, le=500)
+    firecrawl_min_body_words: int = Field(default=30, ge=1)
+    firecrawl_cache_dir: str = "data/firecrawl-cache"
 
     # $ Extracted records are written here as timestamped JSON.$
     output_dir: str = "data"

@@ -8,6 +8,7 @@ from lexcrawl.models.document import (
     TEXT_BEGIN_MARKER,
     ArticleStub,
     CanonicalDocument,
+    DocumentResource,
     RawArticle,
     compute_content_hash,
     ensure_text_marker,
@@ -70,3 +71,54 @@ def test_blank_title_is_rejected() -> None:
     """### A blank required field is rejected."""
     with pytest.raises(ValueError, match="must not be blank"):
         RawArticle(source="cba", url="https://x.test/a", title="  ", language="en")
+
+
+def test_month_precision_requires_month_and_year() -> None:
+    """### Month precision without both parts is rejected."""
+    with pytest.raises(ValueError, match="month precision requires"):
+        CanonicalDocument(
+            source="commerce_reports",
+            source_url="https://x.test/a",
+            title="Report",
+            language="en",
+            published_month=3,
+            published_precision="month",
+        )
+
+
+def test_month_only_date_is_preserved() -> None:
+    """### A month-year date is stored without inventing a day."""
+    document = CanonicalDocument(
+        source="commerce_reports",
+        source_url="https://x.test/a",
+        title="Report",
+        language="en",
+        published_month=3,
+        published_year=2025,
+        published_date_raw="March 2025",
+        published_precision="month",
+    )
+    assert document.published_at is None
+    assert document.published_precision == "month"
+
+
+def test_complete_resource_requires_text_and_hash() -> None:
+    """### A complete resource must carry text and a matching hash."""
+    text = f"{TEXT_BEGIN_MARKER}\nbody"
+    with pytest.raises(ValueError, match="require text and content hash"):
+        DocumentResource(title="report", url="https://x.test/a.pdf", kind="pdf", status="complete")
+    resource = DocumentResource(
+        title="report",
+        url="https://x.test/a.pdf",
+        kind="pdf",
+        status="complete",
+        text=text,
+        content_hash=compute_content_hash(text),
+    )
+    assert resource.text == text
+
+
+def test_resource_without_url_must_be_unavailable() -> None:
+    """### A resource with no URL can only be marked url_unavailable."""
+    with pytest.raises(ValueError, match="without a URL"):
+        DocumentResource(title="report", kind="pdf", status="pending")

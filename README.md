@@ -3,17 +3,18 @@
 Crawling and document-ingestion system for public legal, regulatory, and government
 information. The working architecture guide lives in `.agents/AGENTS.MD`.
 
-This repository is being rebuilt **thin, one source at a time**. Only the Canadian Bar
-Association (CBA) news-releases source is implemented so far; the UAE and Commerce sources,
-persistence, the API, and scheduling are planned next.
+This repository is being rebuilt **thin, one source at a time**. All three sources — CBA news
+releases, Commerce reports, and UAE Legislation news — crawl to canonical JSON; persistence, the
+API, and scheduling are planned next.
 
 ## Status
 
 | Layer | State |
 | --- | --- |
-| CBA news releases (fetch → parse → canonical JSON) | Implemented |
-| UAE Legislation / Commerce | Not started |
-| PDF attachment extraction | Not started |
+| CBA news releases (HTTP → parse → canonical JSON) | Implemented |
+| Commerce reports (Firecrawl → parse → canonical JSON) | Implemented |
+| UAE Legislation news (Firecrawl → parse → canonical JSON) | Implemented |
+| PDF attachment extraction | Not started (attachment URLs captured as metadata) |
 | PostgreSQL persistence | Not started |
 | FastAPI + Swagger UI | Not started |
 | Daily scheduler + Docker Compose | Not started |
@@ -24,11 +25,14 @@ persistence, the API, and scheduling are planned next.
 src/lexcrawl/
 ├── actors/
 │   ├── base.py        # Actor contract + ActorRunResult counters
-│   └── cba.py         # CBA listing feed + article page parsing and Actor
+│   ├── cba.py         # CBA listing feed + article page parsing and Actor
+│   ├── commerce.py    # Commerce reports listing + detail parsing over Firecrawl
+│   └── uae_legislation.py  # UAE news listing + article parsing over Firecrawl
 ├── crawling/
 │   ├── base.py        # Fetcher protocol, FetchedPage, fetch errors, block detection
-│   └── http.py        # httpx strategy: timeouts, bounded retries, pacing, redirect checks
-├── models/document.py # RawArticle, CanonicalDocument, TEXT-BEGIN marker, hashing
+│   ├── http.py        # httpx strategy: timeouts, bounded retries, pacing, redirect checks
+│   └── firecrawl.py   # Firecrawl v2 scrape client (retries, pacing, response cache)
+├── models/document.py # RawArticle, CanonicalDocument, DocumentResource, TEXT-BEGIN, hashing
 ├── pipeline/normalize.py  # shared whitespace and paragraph extraction
 ├── orchestrator.py    # runs actors in isolation, aggregates the run report
 ├── cli.py             # `lexcrawl crawl` entry point
@@ -39,15 +43,17 @@ tests/samples.py       # short structural fixtures (no archived pages)
 ```
 
 Dependency direction: `models` (pure contracts) is innermost; `crawling` is the external I/O
-detail; `actors` depend on `models`, `pipeline`, and the `crawling.base` contract; `orchestrator`
+detail; `actors` depend on `models`, `pipeline`, and the `crawling` contracts; `orchestrator`
 depends on `actors`; `cli` is the composition root.
 
 ## Quick start
 
 ```bash
 uv sync
-cp .env.example .env          # set CRAWL_USER_AGENT if you like
+cp .env.example .env          # set CRAWL_USER_AGENT and FIRECRAWL_API_KEY
 uv run lexcrawl crawl --source cba
+uv run lexcrawl crawl --source commerce --max-pages 1
+uv run lexcrawl crawl --source uae --max-pages 1
 uv run lexcrawl crawl --source cba --max-pages 1 --out data/cba.json
 ```
 
