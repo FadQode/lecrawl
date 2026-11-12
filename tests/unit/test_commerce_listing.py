@@ -75,6 +75,21 @@ def test_parse_listing_ignores_out_of_scope_rows() -> None:
     assert page is None
 
 
+def test_parse_listing_ignores_sort_control_in_date_cell() -> None:
+    """### The date cell's sort control is not part of the parsed date."""
+    page = parse_listing(
+        commerce_listing_html([commerce_row(date_text="January 2025")]),
+        page_url=build_page_url(COMMERCE_LISTING_URL, 0),
+        page_number=0,
+        host=_host(),
+        path_prefixes=_prefixes(),
+    )
+    assert page is not None
+    entry = page.entries[0]
+    assert entry.published_date_raw == "January 2025"
+    assert entry.published_month == 1 and entry.published_year == 2025
+
+
 def test_parse_listing_date_supports_month_year() -> None:
     """### Month-year listing values parse without inventing a day."""
     assert parse_listing_date("January 2025").month == 1

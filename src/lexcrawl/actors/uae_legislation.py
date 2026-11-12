@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
@@ -15,7 +16,7 @@ from lexcrawl.config import required_setting
 from lexcrawl.crawling.base import redact_url
 from lexcrawl.crawling.firecrawl import FirecrawlError, FirecrawlScraper
 from lexcrawl.logging import get_logger
-from lexcrawl.models.document import ArticleStub, CanonicalDocument, RawArticle
+from lexcrawl.models.document import ArticleStub, CanonicalDocument, RawArticle, stable_identity
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
 
 LOGGER = get_logger(__name__)
@@ -252,6 +253,8 @@ class UaeLegislationActor(Actor):
         max_detail_scrapes: int = 20,
         min_body_words: int = 30,
         source_name: str = SOURCE_NAME,
+        is_known: Callable[[str], bool] | None = None,
+        max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing entry point, budgets, and the Firecrawl scraper."""
         self.listing_url = required_setting(listing_url, name="LISTINGS_URL")
@@ -261,6 +264,8 @@ class UaeLegislationActor(Actor):
         self.max_detail_scrapes = max(0, max_detail_scrapes)
         self.min_body_words = max(1, min_body_words)
         self.source_name = source_name
+        self._is_known = is_known
+        self._max_new_items = max_new_items
         self._logger = get_logger(f"{__name__}.{source_name}")
 
     def close(self) -> None:
@@ -365,7 +370,14 @@ class UaeLegislationActor(Actor):
 
     def _acquire(self, stubs: dict[str, ArticleStub], result: ActorRunResult) -> None:
         """### Scrape a detail page for each new article, within the detail budget."""
-        pending = list(stubs.values())
+        pending = [stub for stub in stubs.values() if not self._is_known_stub(stub)]
+        result.records_skipped_known += len(stubs) - len(pending)
+        if self._max_new_items is not None and len(pending) > self._max_new_items:
+            result.anomaly_detected = True
+            result.add_error(
+                f"anomaly: {len(pending)} new article(s) exceeds the {self._max_new_items} item limit; crawl skipped"
+            )
+            return
         for index, stub in enumerate(pending):
             if index >= self.max_detail_scrapes:
                 result.documents_pending = len(pending) - index
@@ -375,6 +387,10 @@ class UaeLegislationActor(Actor):
                 return
             result.detail_pages_attempted += 1
             self._acquire_one(stub, result)
+
+    def _is_known_stub(self, stub: ArticleStub) -> bool:
+        """### Report whether an article identity was already ingested."""
+        return self._is_known is not None and self._is_known(stable_identity(self.source_name, None, stub.url))
 
     def _acquire_one(self, stub: ArticleStub, result: ActorRunResult) -> None:
         """### Acquire and validate one article, isolating its failures."""

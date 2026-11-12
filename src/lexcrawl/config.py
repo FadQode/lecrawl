@@ -62,6 +62,26 @@ class Settings(BaseSettings):
     # $ Extracted records are written here as timestamped JSON.$
     output_dir: str = "data"
 
+    # $ Change-detection watermarks are persisted here until the database exists.$
+    check_state_path: str = "data/state/checks.json"
+
+    # $ Ingested document identities are persisted here until the database exists.$
+    identities_state_path: str = "data/state/identities.json"
+
+    # $ Monthly Firecrawl credit usage is tracked here until the database exists.$
+    usage_state_path: str = "data/state/usage.json"
+
+    # $ Daily scheduler (APScheduler), started by `lexcrawl schedule`.$
+    schedule_enabled: bool = True
+    schedule_daily_cron: str = "0 6 * * *"
+    schedule_timezone: str = "UTC"
+    schedule_lock_path: str = "data/state/scheduler.lock"
+    run_lock_path: str = "data/state/run.lock"
+
+    # $ Guards: pause on an unexpected burst, and cap monthly provider spend.$
+    anomaly_max_new_items: int = Field(default=10, ge=0)
+    firecrawl_monthly_credit_cap: int = Field(default=900, ge=0)
+
 
 def required_setting(value: str, *, name: str) -> str:
     """### Return a required setting, failing fast with an actionable message."""

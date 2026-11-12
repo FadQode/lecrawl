@@ -129,7 +129,8 @@ def commerce_listing_html(
         files = "".join(f'<a href="{url}" title="{url.rsplit("/", 1)[-1]}">PDF</a>' for url in pdf_urls)
         body_rows.append(
             "<tr>"
-            f'<td class="views-field"><div class="tablesaw-cell-content">{date_text}</div></td>'
+            f'<td class="views-field"><a class="sort" href="#">Date Sort ascending</a>'
+            f'<div class="tablesaw-cell-content">{date_text}</div></td>'
             f'<td class="views-field"><div class="tablesaw-cell-content"><a href="{href}">{title}</a></div></td>'
             f'<td class="views-field"><div class="tablesaw-cell-content">{files}</div></td>'
             "</tr>"

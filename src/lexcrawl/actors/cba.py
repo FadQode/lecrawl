@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
@@ -21,6 +22,7 @@ from lexcrawl.models.document import (
     CanonicalDocument,
     DocumentStatus,
     RawArticle,
+    stable_identity,
 )
 from lexcrawl.pipeline.normalize import collapse_whitespace, paragraphs_of, text_of
 
@@ -321,6 +323,8 @@ class CbaNewsReleasesActor(Actor):
         page_size: int = 50,
         max_pages: int = 10,
         source_name: str = SOURCE_NAME,
+        is_known: Callable[[str], bool] | None = None,
+        max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing feed and the enrichment bounds."""
         self.api_url = required_setting(api_url, name="RELEASES_API_URL")
@@ -333,6 +337,8 @@ class CbaNewsReleasesActor(Actor):
         self.page_size = max(1, page_size)
         self.max_pages = max(1, max_pages)
         self.source_name = source_name
+        self._is_known = is_known
+        self._max_new_items = max_new_items
         self._logger = get_logger(f"{__name__}.{source_name}")
 
     def run(self, fetcher: Fetcher) -> ActorRunResult:
@@ -404,13 +410,25 @@ class CbaNewsReleasesActor(Actor):
         )
 
     def _enrich(self, fetcher: Fetcher, state: _RunState, result: ActorRunResult) -> None:
-        """### Fetch each article page, keeping metadata when enrichment fails."""
+        """### Fetch each new article page, keeping metadata when enrichment fails."""
         if not state.discovered:
             result.add_error("no news releases matched the listing feed")
             return
-        for record in state.discovered.values():
+        pending = [record for record in state.discovered.values() if not self._is_known_record(record)]
+        result.records_skipped_known += len(state.discovered) - len(pending)
+        if self._max_new_items is not None and len(pending) > self._max_new_items:
+            result.anomaly_detected = True
+            result.add_error(
+                f"anomaly: {len(pending)} new release(s) exceeds the {self._max_new_items} item limit; crawl skipped"
+            )
+            return
+        for record in pending:
             result.detail_pages_attempted += 1
             self._enrich_record(fetcher, record, result)
+
+    def _is_known_record(self, record: CbaRecord) -> bool:
+        """### Report whether a release identity was already ingested."""
+        return self._is_known is not None and self._is_known(stable_identity(self.source_name, None, record.url))
 
     def _enrich_record(self, fetcher: Fetcher, record: CbaRecord, result: ActorRunResult) -> None:
         """### Fetch, parse and canonicalize one release without affecting siblings."""

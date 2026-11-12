@@ -30,8 +30,10 @@ class ActorRunResult:
     detail_pages_failed: int = 0
     records_missing_required_fields: int = 0
     records_without_text: int = 0
+    records_skipped_known: int = 0
     documents_pending: int = 0
     provider_credits_used: int = 0
+    anomaly_detected: bool = False
     pagination_complete: bool = False
     duration_seconds: float = 0.0
 

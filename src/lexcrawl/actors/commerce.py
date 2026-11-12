@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import unquote, urljoin, urlparse
@@ -223,7 +224,8 @@ def parse_listing(
         if not title:
             continue
         file_cell = _content(cells[files_index]) if files_index is not None and files_index < len(cells) else None
-        raw_date = text_of(cells[date_index]) if date_index < len(cells) else ""
+        date_cell = _content(cells[date_index]) if date_index < len(cells) else None
+        raw_date = text_of(date_cell)
         parsed_date = parse_listing_date(raw_date)
         identity = stable_identity(SOURCE_NAME, None, url)
         entries.setdefault(
@@ -330,6 +332,8 @@ class CommerceReportsActor(Actor):
         max_detail_scrapes: int = 20,
         min_body_words: int = 30,
         source_name: str = SOURCE_NAME,
+        is_known: Callable[[str], bool] | None = None,
+        max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing entry point, budgets, and the Firecrawl scraper."""
         self.listing_url = required_setting(listing_url, name="REPORTS_LISTING_URL")
@@ -341,6 +345,8 @@ class CommerceReportsActor(Actor):
         self.max_detail_scrapes = max(0, max_detail_scrapes)
         self.min_body_words = max(1, min_body_words)
         self.source_name = source_name
+        self._is_known = is_known
+        self._max_new_items = max_new_items
         self._logger = get_logger(f"{__name__}.{source_name}")
 
     def close(self) -> None:
@@ -460,7 +466,14 @@ class CommerceReportsActor(Actor):
 
     def _acquire(self, entries: dict[str, ListingEntry], result: ActorRunResult) -> None:
         """### Scrape a detail page for each new report, within the detail budget."""
-        pending = list(entries.values())
+        pending = [entry for entry in entries.values() if not self._is_known_entry(entry)]
+        result.records_skipped_known += len(entries) - len(pending)
+        if self._max_new_items is not None and len(pending) > self._max_new_items:
+            result.anomaly_detected = True
+            result.add_error(
+                f"anomaly: {len(pending)} new report(s) exceeds the {self._max_new_items} item limit; crawl skipped"
+            )
+            return
         for index, entry in enumerate(pending):
             if index >= self.max_detail_scrapes:
                 result.documents_pending = len(pending) - index
@@ -470,6 +483,10 @@ class CommerceReportsActor(Actor):
                 return
             result.detail_pages_attempted += 1
             self._acquire_one(entry, result)
+
+    def _is_known_entry(self, entry: ListingEntry) -> bool:
+        """### Report whether a report identity was already ingested."""
+        return self._is_known is not None and self._is_known(entry.identity)
 
     def _acquire_one(self, entry: ListingEntry, result: ActorRunResult) -> None:
         """### Acquire and validate one report, isolating its failures."""

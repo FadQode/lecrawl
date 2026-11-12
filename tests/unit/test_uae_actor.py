@@ -190,3 +190,21 @@ def test_actor_runs_over_direct_scraper() -> None:
     assert len(result.documents) == 1
     assert result.documents[0].text is not None
     assert result.provider_credits_used == 0
+
+
+def test_actor_skips_known_articles() -> None:
+    """### Known article identities are skipped without a detail fetch."""
+    firecrawl = FakeFirecrawl({UAE_LISTING_URL: _scraped(UAE_LISTING_URL, uae_listing_html(cards=2, next_page=None))})
+    actor = UaeLegislationActor(
+        listing_url=UAE_LISTING_URL,
+        firecrawl=firecrawl,
+        max_pages=2,
+        max_detail_scrapes=10,
+        min_body_words=3,
+        is_known=lambda _identity: True,
+    )
+    result = actor.run(None)
+
+    assert result.records_skipped_known == 2
+    assert result.detail_pages_attempted == 0
+    assert result.documents == []

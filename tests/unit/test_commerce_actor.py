@@ -158,3 +158,27 @@ def test_actor_keeps_metadata_on_thin_detail() -> None:
     assert document.text is None
     assert document.published_precision == "month"
     assert result.records_without_text == 1
+
+
+def test_actor_skips_known_reports() -> None:
+    """### Known report identities are skipped without a detail fetch."""
+    listing = commerce_listing_html(
+        [commerce_row(slug="report-a", month="01"), commerce_row(slug="report-b", month="02")],
+        start=1,
+        end=2,
+        total=2,
+    )
+    firecrawl = FakeFirecrawl({_listing_url(0): _scraped(_listing_url(0), listing)})
+    actor = CommerceReportsActor(
+        listing_url=COMMERCE_LISTING_URL,
+        firecrawl=firecrawl,
+        max_pages=2,
+        max_detail_scrapes=10,
+        min_body_words=5,
+        is_known=lambda _identity: True,
+    )
+    result = actor.run(None)
+
+    assert result.records_skipped_known == 2
+    assert result.detail_pages_attempted == 0
+    assert result.documents == []
