@@ -15,7 +15,7 @@ from pathlib import Path
 
 from lexcrawl.alerts import ANOMALY, BUDGET_EXCEEDED, CHECK_FAILED, notify
 from lexcrawl.checks.base import CheckOutcome, evaluate
-from lexcrawl.checks.identities import IdentityStore
+from lexcrawl.checks.identities import DocumentMemory
 from lexcrawl.checks.store import WatermarkStore
 from lexcrawl.checks.usage import UsageStore, current_period
 from lexcrawl.config import Settings
@@ -25,6 +25,7 @@ from lexcrawl.factory import (
     CREDIT_SOURCES,
     build_actor,
     build_check,
+    build_document_memory,
     build_http_fetcher,
     build_scraper,
 )
@@ -56,20 +57,23 @@ def run_daily(
 ) -> list[DailySourceResult]:
     """### Probe each source, then crawl only the sources that changed."""
     watermark = WatermarkStore(Path(settings.check_state_path))
-    identities = IdentityStore(Path(settings.identities_state_path))
     usage = UsageStore(Path(settings.usage_state_path))
     period = current_period()
-    return [
-        _run_source(name, settings, watermark, identities, usage, period, force=force, record=record)
-        for name in sources
-    ]
+    memory = build_document_memory(settings)
+    try:
+        return [
+            _run_source(name, settings, watermark, memory, usage, period, force=force, record=record)
+            for name in sources
+        ]
+    finally:
+        memory.close()
 
 
 def _run_source(
     name: str,
     settings: Settings,
     watermark: WatermarkStore,
-    identities: IdentityStore,
+    memory: DocumentMemory,
     usage: UsageStore,
     period: str,
     *,
@@ -114,7 +118,7 @@ def _run_source(
                 detail=f"{probe.summary}; spent={spent}/{settings.firecrawl_monthly_credit_cap}",
             )
 
-        known = identities.known(key)
+        known = memory.known(key)
         max_new = _anomaly_limit(settings, known, force)
         actor = build_actor(
             name,
@@ -141,13 +145,8 @@ def _run_source(
                 detail=f"{probe.summary}; run_status={run.status}",
             )
 
-        ingested = [
-            document.identity_key
-            for document in run.documents
-            if document.identity_key is not None and document.extraction_status == "complete"
-        ]
         if record:
-            identities.add(key, ingested)
+            memory.remember(key, run.documents)
             # $ Advance the watermark only when the run fully succeeded with nothing pending.$
             if run.status == "success" and run.documents_pending == 0:
                 watermark.record(key, probe.fingerprint)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import urlparse
 
 from lexcrawl.actors.base import Actor
@@ -12,6 +13,7 @@ from lexcrawl.actors.uae_legislation import UaeLegislationActor
 from lexcrawl.checks.base import Check
 from lexcrawl.checks.cba import CbaCheck
 from lexcrawl.checks.commerce import CommerceCheck
+from lexcrawl.checks.identities import DocumentMemory, JsonDocumentMemory
 from lexcrawl.checks.uae import UaeCheck
 from lexcrawl.config import Settings
 from lexcrawl.crawling.base import Fetcher
@@ -20,6 +22,8 @@ from lexcrawl.crawling.fallback import FallbackScraper
 from lexcrawl.crawling.firecrawl import FirecrawlClient
 from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.crawling.scrape import Scraper
+from lexcrawl.db.engine import create_db_engine
+from lexcrawl.repositories.memory import DbDocumentMemory
 
 SOURCE_NAMES = ("uae", "commerce", "cba")
 CHECK_SOURCES = ("uae", "commerce", "cba")
@@ -94,6 +98,15 @@ def build_scraper(name: str, settings: Settings) -> Scraper | None:
     if name == "commerce":
         return build_firecrawl(settings)
     return None
+
+
+def build_document_memory(settings: Settings) -> DocumentMemory:
+    """### Build the identity memory: the database by default, JSON for tests/dev."""
+    if settings.state_backend == "json":
+        return JsonDocumentMemory(Path(settings.identities_state_path))
+    if not settings.database_url.strip():
+        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+    return DbDocumentMemory(create_db_engine(settings))
 
 
 def cba_sitemap_url(settings: Settings) -> str:

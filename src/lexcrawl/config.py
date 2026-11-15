@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     # $ Monthly Firecrawl credit usage is tracked here until the database exists.$
     usage_state_path: str = "data/state/usage.json"
 
+    # $ Persistence: the database is the application default; JSON stores are for tests/dev.$
+    database_url: str = ""
+    db_echo: bool = False
+    db_pool_size: int = Field(default=5, ge=1)
+    db_max_overflow: int = Field(default=5, ge=0)
+    db_pool_timeout: float = Field(default=30.0, gt=0)
+    db_connect_timeout: int = Field(default=10, ge=1)
+    state_backend: Literal["db", "json"] = "db"
+
     # $ Daily scheduler (APScheduler), started by `lexcrawl schedule`.$
     schedule_enabled: bool = True
     schedule_daily_cron: str = "0 6 * * *"

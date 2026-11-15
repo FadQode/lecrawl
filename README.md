@@ -18,8 +18,8 @@ API, and scheduling are planned next.
 | Daily incremental run (`lexcrawl daily`): probe → crawl only changes | Implemented |
 | Daily scheduler (`lexcrawl schedule`, APScheduler) + run lock | Implemented |
 | Anomaly guard + monthly credit budget governor | Implemented |
+| PostgreSQL persistence (`sources`, `documents`) + migrations | Implemented (foundation) |
 | PDF attachment extraction | Not started (attachment URLs captured as metadata) |
-| PostgreSQL persistence | Not started |
 | FastAPI + Swagger UI | Not started |
 | Docker Compose | Not started |
 
@@ -55,8 +55,11 @@ src/lexcrawl/
 ├── scheduler.py       # APScheduler daily job around run_daily (`lexcrawl schedule`)
 ├── locking.py         # advisory file lock (scheduled vs manual runs)
 ├── alerts.py          # structured alert hook (anomaly / budget / check_failed)
-├── factory.py         # composition root: builds checks, actors, and scrapers
+├── factory.py         # composition root: builds checks, actors, scrapers, memory
 ├── cli.py             # `lexcrawl crawl` / `check` / `daily` / `schedule`
+├── db/                # SQLAlchemy models, engine, sessions
+├── repositories/      # idempotent reads/writes + the DB identity memory
+└── migrations/        # Alembic migrations
 ├── config.py          # validated settings
 └── logging.py         # structured JSON logging
 tests/unit/            # parser, fetcher, contract, CLI tests (mocked network)
@@ -117,6 +120,20 @@ When a source changed, the actor is handed the set of **already-ingested identit
 only new items. The watermark advances only after a fully successful run (nothing pending), so a
 failed fetch is retried next run. State lives in `data/state/checks.json` (watermarks) and
 `data/state/identities.json` (identities) until the PostgreSQL layer lands.
+
+## Persistence
+
+State lives in PostgreSQL by default (`STATE_BACKEND=db`); the JSON stores remain available for
+tests and explicit local development (`STATE_BACKEND=json`). Apply the schema with:
+
+```bash
+uv run alembic upgrade head
+```
+
+Phase 1 stores `sources` (a seeded registry) and `documents` — the canonical projection, one row
+per source + identity, written with monotonic upserts (a failed re-fetch never replaces good
+content). "What have we already ingested?" is now a query over `documents`; watermarks and monthly
+usage still use the JSON stores until their tables land.
 
 ## Scheduler and guards
 

@@ -68,9 +68,8 @@ def stable_identity(source: str, native_id: str | None, source_url: str) -> str:
     if native_id and native_id.strip():
         return f"{source}:id:{native_id.strip()}"
     parts = urlsplit(source_url)
-    normalized = urlunsplit(
-        (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/") or "/", parts.query, "")
-    )
+    # $ Normalize the host and trailing slash, drop query/fragment; keep path case as-is.$
+    normalized = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/") or "/", "", ""))
     return f"{source}:url:{normalized}"
 
 

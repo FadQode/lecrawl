@@ -15,6 +15,9 @@ dependencies = [
     "lxml>=5.3,<7.0",
     "tenacity>=9.0,<10.0",
     "apscheduler>=3.10,<4.0",
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.13,<2.0",
+    "psycopg[binary]>=3.2,<4.0",
 ]
 
 [project.scripts]
@@ -70,4 +73,5 @@ pythonpath = ["src", "tests"]
 addopts = "-q --strict-markers"
 markers = [
     "live: requires network access to the target source",
+    "db: requires a running PostgreSQL database (DATABASE_URL)",
 ]

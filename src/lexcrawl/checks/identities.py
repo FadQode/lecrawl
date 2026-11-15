@@ -7,9 +7,27 @@ identity table lands.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+from lexcrawl.models.document import CanonicalDocument
+
+
+class DocumentMemory(Protocol):
+    """### Remembers which document identities have been ingested, per source."""
+
+    def known(self, source: str) -> frozenset[str]:
+        """### Return the identities already ingested for a source."""
+        ...
+
+    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
+        """### Record the documents just processed, returning how many were new."""
+        ...
+
+    def close(self) -> None:
+        """### Release any resources."""
+        ...
 
 
 class IdentityStore:
@@ -52,3 +70,28 @@ class IdentityStore:
         if not isinstance(payload, dict):
             return {}
         return {key: value for key, value in payload.items() if isinstance(value, list)}
+
+
+class JsonDocumentMemory:
+    """### JSON-backed identity memory: tracks only the identities of complete documents."""
+
+    def __init__(self, path: Path) -> None:
+        """### Wrap a JSON identity store at the given path."""
+        self._store = IdentityStore(path)
+
+    def known(self, source: str) -> frozenset[str]:
+        """### Return the identities already ingested for a source."""
+        return self._store.known(source)
+
+    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
+        """### Record the identities of completed documents."""
+        keys = [
+            document.identity_key
+            for document in documents
+            if document.identity_key is not None and document.extraction_status == "complete"
+        ]
+        return self._store.add(source, keys)
+
+    def close(self) -> None:
+        """### No resources to release."""
+        return None

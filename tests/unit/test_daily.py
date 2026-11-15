@@ -29,6 +29,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "check_state_path": str(tmp_path / "checks.json"),
         "identities_state_path": str(tmp_path / "identities.json"),
         "usage_state_path": str(tmp_path / "usage.json"),
+        "state_backend": "json",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
