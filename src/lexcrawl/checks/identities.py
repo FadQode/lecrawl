@@ -6,12 +6,12 @@ identity table lands.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
 from lexcrawl.models.document import CanonicalDocument
+from lexcrawl.state_io import read_json_state, write_json_state
 
 
 class DocumentMemory(Protocol):
@@ -22,7 +22,7 @@ class DocumentMemory(Protocol):
         ...
 
     def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
-        """### Record the documents just processed, returning how many were new."""
+        """### Record the processed documents, returning how many were processed."""
         ...
 
     def close(self) -> None:
@@ -55,20 +55,12 @@ class IdentityStore:
             return 0
         state = self._load()
         state[source] = sorted(current | added)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        write_json_state(self._path, state)
         return len(added)
 
     def _load(self) -> dict[str, list[Any]]:
-        """### Load the state file, tolerating absence or corruption."""
-        if not self._path.is_file():
-            return {}
-        try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
+        """### Load the state file, surfacing (not swallowing) corruption."""
+        payload = read_json_state(self._path)
         return {key: value for key, value in payload.items() if isinstance(value, list)}
 
 
@@ -84,13 +76,14 @@ class JsonDocumentMemory:
         return self._store.known(source)
 
     def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
-        """### Record the identities of completed documents."""
+        """### Record the identities of completed documents; return the processed count."""
         keys = [
             document.identity_key
             for document in documents
             if document.identity_key is not None and document.extraction_status == "complete"
         ]
-        return self._store.add(source, keys)
+        self._store.add(source, keys)
+        return len(documents)
 
     def close(self) -> None:
         """### No resources to release."""

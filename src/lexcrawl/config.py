@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     anomaly_max_new_items: int = Field(default=10, ge=0)
     firecrawl_monthly_credit_cap: int = Field(default=900, ge=0)
 
+    # $ Attachment (PDF) extraction retry cap and per-attachment size limit.$
+    resource_extraction_attempts: int = Field(default=3, ge=1, le=20)
+    resource_max_bytes: int = Field(default=20_000_000, gt=0)
+    # $ How long a worker's claim on an attachment stays valid before it can be reclaimed.$
+    resource_claim_lease_seconds: int = Field(default=300, ge=1)
+
 
 def required_setting(value: str, *, name: str) -> str:
     """### Return a required setting, failing fast with an actionable message."""

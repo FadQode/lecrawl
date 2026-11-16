@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from lexcrawl.checks.usage import UsageStore, current_period
 from lexcrawl.config import Settings
 from lexcrawl.scheduler import DAILY_JOB_ID, CrawlScheduler
+from lexcrawl.state_io import StateCorruptionError
 
 
 def test_period_is_year_month() -> None:
@@ -31,11 +34,13 @@ def test_usage_ignores_non_positive(tmp_path: Path) -> None:
     assert store.add("2026-11", -3) == 0
 
 
-def test_usage_corrupt_is_zero(tmp_path: Path) -> None:
-    """### A corrupt usage file reads as zero."""
+def test_usage_corrupt_is_preserved_and_reported(tmp_path: Path) -> None:
+    """### A corrupt usage file is preserved aside and raises instead of reading zero."""
     path = tmp_path / "usage.json"
     path.write_text("{bad", encoding="utf-8")
-    assert UsageStore(path).spent("2026-11") == 0
+    with pytest.raises(StateCorruptionError):
+        UsageStore(path).spent("2026-11")
+    assert list(tmp_path.glob("usage.json.corrupt-*"))
 
 
 def test_scheduler_registers_daily_job(tmp_path: Path) -> None:

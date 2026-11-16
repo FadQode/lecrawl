@@ -18,8 +18,9 @@ API, and scheduling are planned next.
 | Daily incremental run (`lexcrawl daily`): probe → crawl only changes | Implemented |
 | Daily scheduler (`lexcrawl schedule`, APScheduler) + run lock | Implemented |
 | Anomaly guard + monthly credit budget governor | Implemented |
-| PostgreSQL persistence (`sources`, `documents`) + migrations | Implemented (foundation) |
-| PDF attachment extraction | Not started (attachment URLs captured as metadata) |
+| PostgreSQL persistence (`sources`, `documents`, `document_resources`) | Implemented |
+| Content processing service + PDF extraction pipeline (opt-in) | Implemented |
+| PDF attachment extraction wired live per source | Not started (dormant until a byte fetcher is provided) |
 | FastAPI + Swagger UI | Not started |
 | Docker Compose | Not started |
 
@@ -59,6 +60,8 @@ src/lexcrawl/
 ├── cli.py             # `lexcrawl crawl` / `check` / `daily` / `schedule`
 ├── db/                # SQLAlchemy models, engine, sessions
 ├── repositories/      # idempotent reads/writes + the DB identity memory
+├── services/          # content processing: persistence + attachment extraction
+├── pipeline/          # normalization + PDF text extraction
 └── migrations/        # Alembic migrations
 ├── config.py          # validated settings
 └── logging.py         # structured JSON logging
@@ -134,6 +137,17 @@ Phase 1 stores `sources` (a seeded registry) and `documents` — the canonical p
 per source + identity, written with monotonic upserts (a failed re-fetch never replaces good
 content). "What have we already ingested?" is now a query over `documents`; watermarks and monthly
 usage still use the JSON stores until their tables land.
+
+Phase 2 adds `document_resources` and a `ContentProcessingService` that persists a document with
+its attachments and drives **per-attachment** extraction: each PDF is processed independently, with
+its own status, attempts, and `last_extracted_at`, retried up to `RESOURCE_EXTRACTION_ATTEMPTS`
+(default 3) and then left in a terminal `failed` state. Normalization/validation/hashing stay in the
+canonical models; the service only orchestrates. Network fetching runs **outside** any DB
+transaction; claims are **durable** (`claimed_at` + `RESOURCE_CLAIM_LEASE_SECONDS`) so other
+workers/hosts skip a row already being fetched and a crashed claim expires; the byte cap
+(`RESOURCE_MAX_BYTES`) is enforced by the fetcher **while streaming**; and attachment errors are
+redacted before being logged or stored. PDF extraction is **dormant** until a per-source fetcher is
+wired in (so we don't spend Firecrawl PDF credits by default).
 
 ## Scheduler and guards
 

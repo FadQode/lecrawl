@@ -106,7 +106,12 @@ def build_document_memory(settings: Settings) -> DocumentMemory:
         return JsonDocumentMemory(Path(settings.identities_state_path))
     if not settings.database_url.strip():
         raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
-    return DbDocumentMemory(create_db_engine(settings))
+    return DbDocumentMemory(
+        create_db_engine(settings),
+        attempt_cap=settings.resource_extraction_attempts,
+        max_bytes=settings.resource_max_bytes,
+        lease_seconds=settings.resource_claim_lease_seconds,
+    )
 
 
 def cba_sitemap_url(settings: Settings) -> str:

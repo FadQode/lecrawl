@@ -6,10 +6,11 @@ PostgreSQL persistence layer lands.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from lexcrawl.state_io import read_json_state, write_json_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,7 +22,7 @@ class StoredWatermark:
 
 
 class WatermarkStore:
-    """### Read and write per-source fingerprints in a small JSON file."""
+    """### Read and write per-source fingerprints in a small, atomically written JSON file."""
 
     def __init__(self, path: Path) -> None:
         """### Record the state file location."""
@@ -48,17 +49,9 @@ class WatermarkStore:
         """### Store the latest fingerprint for a source with a timestamp."""
         state = self._load()
         state[source] = {"fingerprint": fingerprint, "checked_at": datetime.now(tz=UTC).isoformat()}
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        write_json_state(self._path, state)
 
     def _load(self) -> dict[str, dict[str, object]]:
-        """### Load the state file, tolerating absence or corruption."""
-        if not self._path.is_file():
-            return {}
-        try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
+        """### Load the state file, surfacing (not swallowing) corruption."""
+        payload = read_json_state(self._path)
         return {key: value for key, value in payload.items() if isinstance(value, dict)}

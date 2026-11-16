@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -124,6 +125,26 @@ def redact_url(url: str) -> str:
         for name, value in parse_qsl(parts.query, keep_blank_values=True)
     ]
     return urlunparse(parts._replace(query=urlencode(query)))
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"(://[^:/@\s]+:)[^@\s]+@"), r"\1***@"),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|token|secret|signature|sig|x-amz-signature|authorization)"
+            r"(\s*[=:]\s*)[^\s&]+"
+        ),
+        r"\1\2***",
+    ),
+)
+
+
+def redact_message(text: str, *, limit: int = 2000) -> str:
+    """### Remove credential-like fragments from a message before it is logged or stored."""
+    redacted = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted[:limit]
 
 
 def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
