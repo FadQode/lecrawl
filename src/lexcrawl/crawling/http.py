@@ -123,6 +123,7 @@ class HttpFetcher:
         request_delay_seconds: float = 0.0,
         max_response_bytes: int = 26_214_400,
         allowed_redirect_hosts: tuple[str, ...] = (),
+        allowed_hosts: tuple[str, ...] = (),
         max_redirects: int = 5,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -135,6 +136,7 @@ class HttpFetcher:
         self._backoff_seconds = backoff_seconds
         self._max_response_bytes = max(1, max_response_bytes)
         self._allowed_redirect_hosts = tuple(host.lower().rstrip(".") for host in allowed_redirect_hosts)
+        self._allowed_hosts = tuple(host.lower().rstrip(".") for host in allowed_hosts)
         self._max_redirects = max(0, max_redirects)
         self._sleep = sleep
         self._pacer = RequestPacer(request_delay_seconds, sleep=sleep, monotonic=monotonic)
@@ -247,7 +249,7 @@ class HttpFetcher:
         headers: dict[str, str] | None = None,
     ) -> FetchedPage:
         """### Stream a bounded response and validate every redirect before following it."""
-        validate_http_url(url)
+        validate_http_url(url, allowed_hosts=self._allowed_hosts)
         original_host = urlparse(url).hostname or ""
         allowed_hosts = (*self._allowed_redirect_hosts, original_host.lower().rstrip("."))
         current_url = url

@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from lexcrawl.api.auth import require_bearer_token
 from lexcrawl.api.contracts import JobAccepted, JobRequest
-from lexcrawl.api.dependencies import get_factory
+from lexcrawl.api.dependencies import get_factory, get_settings_dep
+from lexcrawl.config import Settings
 from lexcrawl.db.session import session_scope
 from lexcrawl.factory import SOURCE_NAMES
 from lexcrawl.repositories import jobs as jobs_repo
@@ -27,6 +28,7 @@ def submit_job(
     payload: JobRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     factory: sessionmaker[Session] = Depends(get_factory),
+    settings: Settings = Depends(get_settings_dep),
 ) -> JobAccepted:
     """### Enqueue a crawl job and return 202 Accepted with its run id."""
     if idempotency_key is not None and len(idempotency_key) > 128:
@@ -51,7 +53,11 @@ def submit_job(
             return JobAccepted(
                 run_id=existing.run_id, status=existing.status, status_url=f"/runs/{existing.run_id}"
             )
-        if jobs_repo.has_active(session):
+        if jobs_repo.has_active(
+            session,
+            now=datetime.now(tz=UTC),
+            stale_after_seconds=settings.job_claim_lease_seconds,
+        ):
             raise HTTPException(status_code=409, detail="a crawl run is already active")
         try:
             result = jobs_repo.enqueue(

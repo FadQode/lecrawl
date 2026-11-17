@@ -22,7 +22,8 @@ FirecrawlScraper = Scraper
 
 DEFAULT_API_URL = "https://api.firecrawl.dev/v2/scrape"
 TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
-PERMANENT_STATUS_CODES = frozenset({400, 401, 402, 403, 404, 422})
+AUTH_STATUS_CODES = frozenset({401, 402})
+PERMANENT_STATUS_CODES = frozenset({400, 403, 404, 422})
 MAX_BACKOFF_SECONDS = 30.0
 
 
@@ -42,6 +43,8 @@ class FirecrawlClient:
         max_retries: int = 2,
         request_delay_seconds: float = 0.0,
         cache_dir: str | None = None,
+        cache_ttl_seconds: float = 7 * 24 * 3600,
+        max_response_bytes: int = 26_214_400,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -52,6 +55,8 @@ class FirecrawlClient:
         self._request_delay_seconds = max(0.0, request_delay_seconds)
         self._sleep = sleep
         self._cache_dir = Path(cache_dir) if cache_dir else None
+        self._cache_ttl_seconds = max(0.0, cache_ttl_seconds)
+        self._max_response_bytes = max(1, max_response_bytes)
         # $ The provider can send an undecodable gzip header, so ask for identity encoding.$
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(timeout_seconds),
@@ -79,7 +84,9 @@ class FirecrawlClient:
             LOGGER.info("firecrawl_cache_hit", extra={"url": url})
             return cached
         page = self._scrape_with_retries(url)
-        if cache:
+        # $ Never cache error/challenge/thin pages, or a retry would replay the failure forever.$
+        cacheable = (page.target_status is None or page.target_status < 400) and bool(page.html.strip())
+        if cache and cacheable:
             self._write_cache(url, page)
         return page
 
@@ -96,16 +103,27 @@ class FirecrawlClient:
                     raise
                 last_error = error
                 if attempt < self._max_retries:
-                    # $ Backoff grows exponentially but stays bounded.$
-                    self._sleep(min(MAX_BACKOFF_SECONDS, self._request_delay_seconds * (2**attempt) or 1.0))
+                    # $ Honour Retry-After when present, else exponential backoff, bounded.$
+                    delay = (
+                        error.retry_after_seconds
+                        if error.retry_after_seconds is not None
+                        else (self._request_delay_seconds * (2**attempt) or 1.0)
+                    )
+                    self._sleep(min(MAX_BACKOFF_SECONDS, delay))
         assert last_error is not None
         raise last_error
 
     def _request(self, url: str) -> ScrapedPage:
         """### Perform one scrape request and translate its outcome."""
-        status_code, raw = self._send(url)
-        if status_code in PERMANENT_STATUS_CODES:
+        status_code, raw, retry_after = self._send(url)
+        if status_code in AUTH_STATUS_CODES:
             raise FirecrawlAuthError(
+                f"firecrawl rejected the credentials with status {status_code}",
+                url=url,
+                status_code=status_code,
+            )
+        if status_code in PERMANENT_STATUS_CODES:
+            raise FirecrawlError(
                 f"firecrawl rejected the request with status {status_code}",
                 url=url,
                 status_code=status_code,
@@ -116,6 +134,7 @@ class FirecrawlClient:
                 url=url,
                 status_code=status_code,
                 retryable=True,
+                retry_after_seconds=retry_after,
             )
         if status_code >= 400:
             raise FirecrawlError(f"firecrawl unexpected status {status_code}", url=url, status_code=status_code)
@@ -139,7 +158,7 @@ class FirecrawlClient:
             credits_used=credits,
         )
 
-    def _send(self, url: str) -> tuple[int, bytes]:
+    def _send(self, url: str) -> tuple[int, bytes, float | None]:
         """### Send the scrape request and read the raw body without auto-decoding."""
         request = self._client.build_request(
             "POST",
@@ -153,19 +172,28 @@ class FirecrawlClient:
             raise FirecrawlError(f"firecrawl timeout: {error}", url=url, retryable=True) from error
         except httpx.TransportError as error:
             raise FirecrawlError(f"firecrawl transport error: {error}", url=url, retryable=True) from error
+        chunks: list[bytes] = []
+        total = 0
         try:
-            raw = b"".join(response.iter_raw())
+            for chunk in response.iter_raw():
+                total += len(chunk)
+                if total > self._max_response_bytes:
+                    raise FirecrawlError(
+                        f"firecrawl response exceeds the {self._max_response_bytes}-byte limit", url=url
+                    )
+                chunks.append(chunk)
         except httpx.HTTPError as error:
             raise FirecrawlError(f"firecrawl response could not be read: {error}", url=url, retryable=True) from error
         finally:
             response.close()
+        raw = b"".join(chunks)
         # $ The provider can announce gzip on a plain body, so decode on the payload itself.$
         if raw[:2] == b"\x1f\x8b":
             try:
                 raw = gzip.decompress(raw)
             except OSError as error:
                 raise FirecrawlError(f"firecrawl gzip body is invalid: {error}", url=url) from error
-        return response.status_code, raw
+        return response.status_code, raw, _parse_retry_after(response.headers.get("retry-after"))
 
     @staticmethod
     def _payload(raw: bytes, url: str) -> dict[str, object]:
@@ -198,6 +226,10 @@ class FirecrawlClient:
             return None
         if not isinstance(stored, dict) or stored.get("url") != url:
             return None
+        if self._cache_ttl_seconds > 0:
+            fetched_at = stored.get("fetched_at")
+            if not isinstance(fetched_at, (int, float)) or (time.time() - float(fetched_at)) > self._cache_ttl_seconds:
+                return None
         return ScrapedPage(
             requested_url=url,
             provider_status=int(stored.get("provider_status") or 200),
@@ -222,8 +254,19 @@ class FirecrawlClient:
                     "target_status": page.target_status,
                     "html": page.html,
                     "markdown": page.markdown,
+                    "fetched_at": time.time(),
                 },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """### Parse a Retry-After header (delta-seconds) into seconds."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return None

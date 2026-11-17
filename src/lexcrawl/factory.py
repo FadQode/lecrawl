@@ -29,12 +29,13 @@ from lexcrawl.crawling.http import HttpFetcher
 from lexcrawl.crawling.scrape import Scraper
 from lexcrawl.db.engine import create_db_engine
 from lexcrawl.repositories.memory import DbDocumentMemory
+from lexcrawl.services.fetchers import HttpResourceFetcher
 
 SOURCE_NAMES = ("uae", "commerce", "cba")
 CHECK_SOURCES = ("uae", "commerce", "cba")
 
 # $ Sources whose acquisition path spends provider credits (Firecrawl).$
-CREDIT_SOURCES = ("commerce",)
+CREDIT_SOURCES = ("commerce", "uae")  # $ UAE can fall back to Firecrawl when challenged.$
 
 
 def build_firecrawl(settings: Settings) -> FirecrawlClient:
@@ -52,7 +53,12 @@ def build_firecrawl(settings: Settings) -> FirecrawlClient:
 def redirect_host_allowlist(settings: Settings) -> tuple[str, ...]:
     """### Allow redirects among configured source hosts and their www aliases."""
     hosts: set[str] = set()
-    for value in (settings.releases_api_url, settings.releases_site_url, settings.listings_url):
+    for value in (
+        settings.releases_api_url,
+        settings.releases_site_url,
+        settings.listings_url,
+        settings.reports_listing_url,
+    ):
         host = (urlparse(value).hostname or value).lower().rstrip(".")
         if not host:
             continue
@@ -71,6 +77,7 @@ def build_http_fetcher(settings: Settings) -> Fetcher:
         request_delay_seconds=settings.crawl_request_delay_seconds,
         max_response_bytes=settings.crawl_max_response_bytes,
         allowed_redirect_hosts=redirect_host_allowlist(settings),
+        allowed_hosts=redirect_host_allowlist(settings),
     )
 
 
@@ -118,6 +125,7 @@ def build_document_memory(settings: Settings, *, engine: Engine | None = None) -
         owns_engine = True
     return DbDocumentMemory(
         engine,
+        fetcher=HttpResourceFetcher(build_http_fetcher(settings)),
         attempt_cap=settings.resource_extraction_attempts,
         max_bytes=settings.resource_max_bytes,
         lease_seconds=settings.resource_claim_lease_seconds,

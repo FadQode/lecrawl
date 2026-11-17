@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -149,12 +149,39 @@ def reclaim_stale(session: Session, *, now: datetime, lease_seconds: int) -> int
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-def has_active(session: Session) -> bool:
-    """### Report whether a job or run is currently executing."""
+def has_active(session: Session, *, now: datetime, stale_after_seconds: int) -> bool:
+    """### Report whether a non-stale job or run is currently executing."""
+    cutoff = now - timedelta(seconds=max(1, stale_after_seconds))
     active_job = session.scalar(
-        select(Job.id).where(Job.status.in_(("claimed", "running"))).limit(1)
+        select(Job.id)
+        .where(
+            Job.status.in_(("claimed", "running")),
+            or_(Job.claimed_at.is_(None), Job.claimed_at >= cutoff),
+        )
+        .limit(1)
     )
     if active_job is not None:
         return True
-    active_run = session.scalar(select(CrawlRun.id).where(CrawlRun.status == "running").limit(1))
+    active_run = session.scalar(
+        select(CrawlRun.id).where(CrawlRun.status == "running", CrawlRun.started_at >= cutoff).limit(1)
+    )
     return active_run is not None
+
+
+def abandon_stale_runs(session: Session, *, now: datetime, lease_seconds: int) -> int:
+    """### Mark runs whose worker died (stale 'running' rows) as failed."""
+    cutoff = now - timedelta(seconds=max(1, lease_seconds))
+    result = session.execute(
+        update(CrawlRun)
+        .where(CrawlRun.status == "running", CrawlRun.started_at < cutoff)
+        .values(status="failed", finished_at=now)
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def touch(session: Session, *, job_id: int, now: datetime) -> None:
+    """### Refresh a running job's claim heartbeat."""
+    row = session.get(Job, job_id)
+    if row is not None:
+        row.claimed_at = now
+        row.updated_at = now

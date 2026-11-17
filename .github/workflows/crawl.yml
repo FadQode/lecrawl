@@ -12,20 +12,10 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: lexcrawl
-          POSTGRES_PASSWORD: lexcrawl
-          POSTGRES_DB: lexcrawl
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U lexcrawl -d lexcrawl"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+    # $ The crawl must persist checkpoints/identities/credits, so it uses a durable
+    # $ external PostgreSQL (DATABASE_URL secret) rather than an ephemeral service container.
     env:
-      DATABASE_URL: postgresql+psycopg://lexcrawl:lexcrawl@localhost:5432/lexcrawl
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       STATE_BACKEND: db
       FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
       CRAWL_USER_AGENT: ${{ vars.CRAWL_USER_AGENT || 'LexCrawl/0.1' }}
@@ -40,7 +30,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: pip install uv
+        run: pip install uv==0.13.6
       - name: Sync dependencies
         run: uv sync --frozen
       - name: Migrate

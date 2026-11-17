@@ -22,12 +22,21 @@ class ScrapedPage:
 class ScrapeError(RuntimeError):
     """### Raised when an acquisition cannot produce a usable page."""
 
-    def __init__(self, message: str, *, url: str, status_code: int | None = None, retryable: bool = False) -> None:
-        """### Record the failure with its target URL and HTTP status."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str,
+        status_code: int | None = None,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        """### Record the failure with its target URL, HTTP status, and retry hint."""
         super().__init__(message)
         self.url = url
         self.status_code = status_code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ScrapeChallengeError(ScrapeError):

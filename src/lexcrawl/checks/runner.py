@@ -89,20 +89,20 @@ def run_daily(
     """### Probe each source, crawl what needs it, and record the run."""
     runtime = build_runtime(settings, engine=engine)
     advisory = AdvisoryLock(runtime.engine) if (record and runtime.engine is not None) else None
-    if advisory is not None and not advisory.acquire():
-        runtime.close()
-        raise RunInProgressError("another crawl run is active")
-    checkpoints = runtime.checkpoints
-    memory = runtime.memory
-    recorder = runtime.recorder
-    budget = build_credit_budget(settings, engine=runtime.engine)
-    period = current_period()
-    effective_trigger = "bootstrap" if bootstrap else "force" if force else trigger
-    started_at = datetime.now(tz=UTC)
-    handle = recorder.start(effective_trigger, run_id=run_id) if record else None
     results: list[DailySourceResult] = []
     run_status = "failed"
+    started_at = datetime.now(tz=UTC)
+    handle: RunHandle | None = None
     try:
+        if advisory is not None and not advisory.acquire():
+            raise RunInProgressError("another crawl run is active")
+        checkpoints = runtime.checkpoints
+        memory = runtime.memory
+        recorder = runtime.recorder
+        budget = build_credit_budget(settings, engine=runtime.engine)
+        period = current_period()
+        effective_trigger = "bootstrap" if bootstrap else "force" if force else trigger
+        handle = recorder.start(effective_trigger, run_id=run_id) if record else None
         for name in sources:
             result = _safe_run_source(
                 name,

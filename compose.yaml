@@ -3,10 +3,10 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: lexcrawl
-      POSTGRES_PASSWORD: lexcrawl
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: lexcrawl
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lexcrawl -d lexcrawl"]
       interval: 5s
@@ -19,9 +19,9 @@ services:
     build: .
     command: ["alembic", "upgrade", "head"]
     environment: &app_env
-      DATABASE_URL: postgresql+psycopg://lexcrawl:lexcrawl@db:5432/lexcrawl
+      DATABASE_URL: postgresql+psycopg://lexcrawl:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/lexcrawl
       STATE_BACKEND: db
-      API_TOKEN: ${API_TOKEN:-change-me}
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN}
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       CRAWL_USER_AGENT: ${CRAWL_USER_AGENT:-LexCrawl/0.1}
       LISTINGS_URL: ${LISTINGS_URL:-https://uaelegislation.gov.ae/ar/news}
