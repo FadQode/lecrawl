@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from lexcrawl.actors.commerce import SOURCE_NAME, build_page_url, parse_listing
 from lexcrawl.checks.base import Check, CheckProbe
+from lexcrawl.checks.fingerprints import commerce_fingerprint
 from lexcrawl.crawling.scrape import ScrapeError, Scraper
 from lexcrawl.logging import get_logger
 
@@ -50,7 +51,7 @@ class CommerceCheck(Check):
             return self._failed(started_at, "listing returned no report rows")
 
         head = page.entries[0].identity
-        fingerprint = f"{head}:{page.total_reports}"
+        fingerprint = commerce_fingerprint(head, page.total_reports)
         return CheckProbe(
             source=self.name,
             ok=True,

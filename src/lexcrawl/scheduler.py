@@ -27,7 +27,7 @@ def run_scheduled_job(settings: Settings) -> list[DailySourceResult]:
         LOGGER.warning("scheduled_run_skipped_locked")
         return []
     try:
-        results = run_daily(settings, sources=CHECK_SOURCES)
+        results = run_daily(settings, sources=CHECK_SOURCES, trigger="scheduled")
     except Exception:
         # $ A scheduled failure is logged, never raised into the scheduler thread.$
         LOGGER.exception("scheduled_daily_failed")

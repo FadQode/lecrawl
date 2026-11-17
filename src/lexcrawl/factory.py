@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+
+from sqlalchemy import Engine
 
 from lexcrawl.actors.base import Actor
 from lexcrawl.actors.cba import CbaNewsReleasesActor
@@ -12,8 +15,10 @@ from lexcrawl.actors.commerce import CommerceReportsActor
 from lexcrawl.actors.uae_legislation import UaeLegislationActor
 from lexcrawl.checks.base import Check
 from lexcrawl.checks.cba import CbaCheck
+from lexcrawl.checks.checkpoints import CheckpointStore, DbCheckpointStore, JsonCheckpointStore
 from lexcrawl.checks.commerce import CommerceCheck
 from lexcrawl.checks.identities import DocumentMemory, JsonDocumentMemory
+from lexcrawl.checks.run_records import DbRunRecorder, NoOpRunRecorder, RunRecorder
 from lexcrawl.checks.uae import UaeCheck
 from lexcrawl.config import Settings
 from lexcrawl.crawling.base import Fetcher
@@ -100,18 +105,88 @@ def build_scraper(name: str, settings: Settings) -> Scraper | None:
     return None
 
 
-def build_document_memory(settings: Settings) -> DocumentMemory:
-    """### Build the identity memory: the database by default, JSON for tests/dev."""
+def build_document_memory(settings: Settings, *, engine: Engine | None = None) -> DocumentMemory:
+    """### Build the identity memory, optionally sharing an injected engine."""
     if settings.state_backend == "json":
         return JsonDocumentMemory(Path(settings.identities_state_path))
-    if not settings.database_url.strip():
-        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+    if engine is not None:
+        owns_engine = False
+    else:
+        if not settings.database_url.strip():
+            raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+        engine = create_db_engine(settings)
+        owns_engine = True
     return DbDocumentMemory(
-        create_db_engine(settings),
+        engine,
         attempt_cap=settings.resource_extraction_attempts,
         max_bytes=settings.resource_max_bytes,
         lease_seconds=settings.resource_claim_lease_seconds,
+        document_attempt_cap=settings.document_extraction_attempts,
+        owns_engine=owns_engine,
     )
+
+
+@dataclass(slots=True)
+class Runtime:
+    """### Process-wide persistence components sharing one engine."""
+
+    engine: Engine | None
+    memory: DocumentMemory
+    checkpoints: CheckpointStore
+    recorder: RunRecorder
+    owns_engine: bool = False
+
+    def close(self) -> None:
+        """### Close components (no-op for borrowed engines), then dispose if owned."""
+        for component in (self.memory, self.checkpoints, self.recorder):
+            component.close()
+        if self.owns_engine and self.engine is not None:
+            self.engine.dispose()
+
+
+def build_runtime(settings: Settings, *, engine: Engine | None = None) -> Runtime:
+    """### Build memory/checkpoints/recorder over one engine (or JSON components)."""
+    if settings.state_backend == "json":
+        return Runtime(
+            engine=None,
+            memory=build_document_memory(settings),
+            checkpoints=build_checkpoint_store(settings),
+            recorder=build_run_recorder(settings),
+        )
+    owns_engine = engine is None
+    if engine is None:
+        if not settings.database_url.strip():
+            raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+        engine = create_db_engine(settings)
+    return Runtime(
+        engine=engine,
+        memory=build_document_memory(settings, engine=engine),
+        checkpoints=build_checkpoint_store(settings, engine=engine),
+        recorder=build_run_recorder(settings, engine=engine),
+        owns_engine=owns_engine,
+    )
+
+
+def build_run_recorder(settings: Settings, *, engine: Engine | None = None) -> RunRecorder:
+    """### Build the crawl-run recorder, optionally sharing an injected engine."""
+    if settings.state_backend == "json":
+        return NoOpRunRecorder()
+    if engine is not None:
+        return DbRunRecorder(engine, owns_engine=False)
+    if not settings.database_url.strip():
+        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+    return DbRunRecorder(create_db_engine(settings))
+
+
+def build_checkpoint_store(settings: Settings, *, engine: Engine | None = None) -> CheckpointStore:
+    """### Build the checkpoint store, optionally sharing an injected engine."""
+    if settings.state_backend == "json":
+        return JsonCheckpointStore(Path(settings.check_state_path))
+    if engine is not None:
+        return DbCheckpointStore(engine, owns_engine=False)
+    if not settings.database_url.strip():
+        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
+    return DbCheckpointStore(create_db_engine(settings))
 
 
 def cba_sitemap_url(settings: Settings) -> str:

@@ -7,16 +7,26 @@ write refreshes the discovery metadata and `last_seen_at`.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from lexcrawl.db.models import Document
 from lexcrawl.models.document import CanonicalDocument
 
 COMPLETE = "complete"
+DUE_STATUSES = ("pending", "failed")
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertCounts:
+    """### How many documents were inserted versus refreshed."""
+
+    inserted: int = 0
+    updated: int = 0
 
 
 def _published_precision(document: CanonicalDocument) -> str:
@@ -62,8 +72,16 @@ def _is_successful(document: CanonicalDocument) -> bool:
     return document.extraction_status == COMPLETE and document.text is not None
 
 
-def upsert_document(session: Session, *, source_id: int, document: CanonicalDocument, now: datetime) -> int:
-    """### Insert or refresh one document, keeping good content over a failed re-fetch."""
+def upsert_document_with_status(
+    session: Session, *, source_id: int, document: CanonicalDocument, now: datetime
+) -> tuple[int, bool]:
+    """### Insert or refresh one document; return (id, was_inserted).
+
+    The write is guarded by the `(source_id, identity_key)` unique constraint and applies
+    the monotonic content rule (a failed re-fetch never replaces good content). The
+    documented worker model is one writer per database; batched `ON CONFLICT` upserts are
+    deferred until measured volume justifies them.
+    """
     values = _values(document, source_id)
     existing = session.scalar(
         select(Document).where(
@@ -81,9 +99,8 @@ def upsert_document(session: Session, *, source_id: int, document: CanonicalDocu
         )
         session.add(row)
         session.flush()
-        return row.id
+        return row.id, True
 
-    # $ Only replace content when the new extraction succeeded, or the old one never did.$
     if _is_successful(document) or existing.extraction_status != COMPLETE:
         existing.text = values["text"]
         existing.content_hash = values["content_hash"]
@@ -109,16 +126,26 @@ def upsert_document(session: Session, *, source_id: int, document: CanonicalDocu
     existing.last_seen_at = now
     existing.updated_at = now
     session.flush()
-    return existing.id
+    return existing.id, False
+
+
+def upsert_document(session: Session, *, source_id: int, document: CanonicalDocument, now: datetime) -> int:
+    """### Insert or refresh one document and return its id."""
+    return upsert_document_with_status(session, source_id=source_id, document=document, now=now)[0]
 
 
 def upsert_documents(
     session: Session, *, source_id: int, documents: Sequence[CanonicalDocument], now: datetime
-) -> int:
-    """### Upsert every document and return how many were written."""
+) -> UpsertCounts:
+    """### Upsert every document, returning inserted and updated counts."""
+    inserted = 0
     for document in documents:
-        upsert_document(session, source_id=source_id, document=document, now=now)
-    return len(documents)
+        _, was_inserted = upsert_document_with_status(
+            session, source_id=source_id, document=document, now=now
+        )
+        if was_inserted:
+            inserted += 1
+    return UpsertCounts(inserted=inserted, updated=len(documents) - inserted)
 
 
 def known_identities(session: Session, *, source_id: int) -> frozenset[str]:
@@ -129,3 +156,17 @@ def known_identities(session: Session, *, source_id: int) -> frozenset[str]:
         )
     )
     return frozenset(rows)
+
+
+def count_due_documents(session: Session, *, source_id: int, attempt_cap: int) -> int:
+    """### Count documents still due for retry within the attempt cap."""
+    total = session.scalar(
+        select(func.count())
+        .select_from(Document)
+        .where(
+            Document.source_id == source_id,
+            Document.extraction_status.in_(DUE_STATUSES),
+            Document.extraction_attempts < attempt_cap,
+        )
+    )
+    return int(total or 0)

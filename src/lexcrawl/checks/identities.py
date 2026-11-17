@@ -7,11 +7,22 @@ identity table lands.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from lexcrawl.models.document import CanonicalDocument
 from lexcrawl.state_io import read_json_state, write_json_state
+
+
+@dataclass(frozen=True, slots=True)
+class RememberResult:
+    """### What a persistence pass recorded."""
+
+    documents: int = 0
+    inserted: int = 0
+    updated: int = 0
+    resources: int = 0
 
 
 class DocumentMemory(Protocol):
@@ -21,8 +32,12 @@ class DocumentMemory(Protocol):
         """### Return the identities already ingested for a source."""
         ...
 
-    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
-        """### Record the processed documents, returning how many were processed."""
+    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> RememberResult:
+        """### Record the processed documents, returning what was recorded."""
+        ...
+
+    def due_count(self, source: str) -> int:
+        """### Return how many documents are still due for retry."""
         ...
 
     def close(self) -> None:
@@ -75,15 +90,27 @@ class JsonDocumentMemory:
         """### Return the identities already ingested for a source."""
         return self._store.known(source)
 
-    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> int:
-        """### Record the identities of completed documents; return the processed count."""
-        keys = [
-            document.identity_key
+    def remember(self, source: str, documents: Sequence[CanonicalDocument]) -> RememberResult:
+        """### Record completed identities and report approximate insert/update counts."""
+        known_before = self._store.known(source)
+        completed = [
+            document
             for document in documents
             if document.identity_key is not None and document.extraction_status == "complete"
         ]
-        self._store.add(source, keys)
-        return len(documents)
+        inserted = sum(1 for document in completed if document.identity_key not in known_before)
+        self._store.add(source, [str(document.identity_key) for document in completed])
+        resources = sum(len(document.resources) for document in documents)
+        return RememberResult(
+            documents=len(documents),
+            inserted=inserted,
+            updated=len(completed) - inserted,
+            resources=resources,
+        )
+
+    def due_count(self, source: str) -> int:
+        """### JSON memory does not track pending documents for retry."""
+        return 0
 
     def close(self) -> None:
         """### No resources to release."""

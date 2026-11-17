@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
 
 from lexcrawl.actors.uae_legislation import SOURCE_NAME, article_scope, parse_listing
 from lexcrawl.checks.base import Check, CheckProbe
+from lexcrawl.checks.fingerprints import uae_fingerprint
 from lexcrawl.crawling.scrape import ScrapeError, Scraper
 from lexcrawl.logging import get_logger
 
@@ -44,8 +44,8 @@ class UaeCheck(Check):
         if not page.stubs:
             return self._failed(started_at, "listing returned no article cards")
 
-        urls = sorted(stub.url for stub in page.stubs)
-        fingerprint = hashlib.sha256("\n".join(urls).encode("utf-8")).hexdigest()
+        urls = [stub.url for stub in page.stubs]
+        fingerprint = uae_fingerprint(urls)
         newest = max((stub.published_at for stub in page.stubs if stub.published_at), default=None)
         return CheckProbe(
             source=self.name,

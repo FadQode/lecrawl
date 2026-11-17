@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 
 from lexcrawl.actors.cba import SOURCE_NAME
 from lexcrawl.checks.base import Check, CheckProbe
+from lexcrawl.checks.fingerprints import cba_fingerprint
 from lexcrawl.crawling.base import Fetcher, FetchError
 from lexcrawl.logging import get_logger
 
@@ -52,7 +53,7 @@ class CbaCheck(Check):
             return self._failed(started_at, "sitemap listed no article URLs")
 
         newest = max(lastmods) if lastmods else "unknown"
-        fingerprint = f"{count}:{newest}"
+        fingerprint = cba_fingerprint(count, newest)
         return CheckProbe(
             source=self.name,
             ok=True,

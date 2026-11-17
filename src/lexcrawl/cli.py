@@ -9,9 +9,9 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-from lexcrawl.checks.base import Check, evaluate
+from lexcrawl.checks.base import Check
+from lexcrawl.checks.change_detection import ChangeDetectionService
 from lexcrawl.checks.runner import DailySourceResult, run_daily
-from lexcrawl.checks.store import WatermarkStore
 from lexcrawl.config import Settings, get_settings
 from lexcrawl.crawling.base import Fetcher
 from lexcrawl.crawling.http import HttpFetcher
@@ -20,11 +20,12 @@ from lexcrawl.factory import (
     SOURCE_NAMES,
     build_actor,
     build_check,
+    build_checkpoint_store,
     build_http_fetcher,
     build_scraper,
     redirect_host_allowlist,
 )
-from lexcrawl.locking import FileLock
+from lexcrawl.locking import FileLock, RunInProgressError
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
 from lexcrawl.scheduler import CrawlScheduler
@@ -37,6 +38,7 @@ CHECK_EXIT_CODES = {
     "check_failed": 2,
     "anomaly": 2,
     "budget_exceeded": 2,
+    "failed": 2,
 }
 
 
@@ -73,11 +75,21 @@ def build_parser() -> argparse.ArgumentParser:
     daily = subcommands.add_parser("daily", help="probe every source, then crawl only the ones that changed")
     daily.add_argument("--source", choices=[*CHECK_SOURCES, "all"], default="all")
     daily.add_argument("--force", action="store_true", help="bypass change detection and crawl anyway")
+    daily.add_argument("--bootstrap", action="store_true", help="ingest everything once, ignoring checkpoints")
     daily.add_argument("--dry-run", action="store_true", help="report without writing watermark or identities")
     _add_logging_options(daily)
 
     schedule = subcommands.add_parser("schedule", help="run the daily job on a cron until stopped")
     _add_logging_options(schedule)
+
+    serve = subcommands.add_parser("serve", help="run the HTTP API (FastAPI/uvicorn)")
+    serve.add_argument("--host", default=None)
+    serve.add_argument("--port", type=int, default=None)
+    _add_logging_options(serve)
+
+    worker = subcommands.add_parser("worker", help="claim and run queued crawl jobs")
+    worker.add_argument("--once", action="store_true", help="process at most one queued job then exit")
+    _add_logging_options(worker)
     return parser
 
 
@@ -161,27 +173,28 @@ def run_checks(arguments: argparse.Namespace, settings: Settings) -> int:
         print(f"configuration error: {error}")
         return 2
 
-    store = WatermarkStore(Path(settings.check_state_path))
+    store = build_checkpoint_store(settings)
     exit_code = 0
     try:
         for check in checks:
             probe = check.probe()
-            outcome = evaluate(probe, store.get(check.name).fingerprint)
-            print(f"{check.name}: {outcome} ({probe.duration_seconds:.2f}s) - {probe.summary}")
+            decision = ChangeDetectionService(store, record=not arguments.dry_run).decide(check.name, probe)
+            print(f"{check.name}: {decision.outcome} ({probe.duration_seconds:.2f}s) - {probe.summary}")
             if probe.error is not None:
                 print(f"  error: {probe.error}")
-            elif not arguments.dry_run:
-                store.record(check.name, probe.fingerprint)
-            exit_code = max(exit_code, CHECK_EXIT_CODES[outcome])
+            exit_code = max(exit_code, CHECK_EXIT_CODES[decision.outcome])
             LOG.info(
                 "check_finished",
-                extra={"source": check.name, "outcome": outcome, "duration_seconds": probe.duration_seconds},
+                extra={
+                    "source": check.name,
+                    "outcome": decision.outcome,
+                    "duration_seconds": probe.duration_seconds,
+                },
             )
     finally:
         for check in checks:
             check.close()
-    if not arguments.dry_run:
-        print(f"watermark: {store.path}")
+        store.close()
     return exit_code
 
 
@@ -193,7 +206,17 @@ def run_daily_command(arguments: argparse.Namespace, settings: Settings) -> int:
         print("a daily run is already in progress; skipping")
         return 2
     try:
-        results = run_daily(settings, sources=names, force=arguments.force, record=not arguments.dry_run)
+        results = run_daily(
+            settings,
+            sources=names,
+            force=arguments.force,
+            bootstrap=arguments.bootstrap,
+            record=not arguments.dry_run,
+            trigger="manual",
+        )
+    except RunInProgressError:
+        print("a crawl run is already active; try again later")
+        return 2
     except ValueError as error:
         print(f"configuration error: {error}")
         return 2
@@ -206,6 +229,47 @@ def run_daily_command(arguments: argparse.Namespace, settings: Settings) -> int:
         print(render_daily(result))
         exit_code = max(exit_code, CHECK_EXIT_CODES[result.outcome])
     return exit_code
+
+
+def run_serve_command(arguments: argparse.Namespace, settings: Settings) -> int:
+    """### Run the FastAPI application with uvicorn."""
+    import uvicorn
+
+    from lexcrawl.api.app import create_app
+
+    app = create_app(settings)
+    uvicorn.run(app, host=arguments.host or settings.api_host, port=arguments.port or settings.api_port)
+    return 0
+
+
+def run_worker_command(arguments: argparse.Namespace, settings: Settings) -> int:
+    """### Claim and run queued crawl jobs (once, or until interrupted)."""
+    from lexcrawl.worker import run_once
+
+    try:
+        if arguments.once:
+            processed = run_once(settings)
+            print("processed a job" if processed else "no queued jobs")
+            return 0
+        stop = threading.Event()
+
+        def _handle(signum: int, frame: object) -> None:
+            """### Signal the worker loop to stop."""
+            stop.set()
+
+        previous_int = signal.signal(signal.SIGINT, _handle)
+        previous_term = signal.signal(signal.SIGTERM, _handle)
+        try:
+            while not stop.is_set():
+                if not run_once(settings):
+                    stop.wait(5.0)
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+        return 0
+    except ValueError as error:
+        print(f"configuration error: {error}")
+        return 2
 
 
 def run_schedule_command(settings: Settings) -> int:
@@ -300,6 +364,10 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
         return run_daily_command(arguments, settings)
     if arguments.command == "schedule":
         return run_schedule_command(settings)
+    if arguments.command == "worker":
+        return run_worker_command(arguments, settings)
+    if arguments.command == "serve":
+        return run_serve_command(arguments, settings)
     return run_crawl_command(arguments, settings)
 
 

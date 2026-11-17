@@ -91,11 +91,22 @@ class Settings(BaseSettings):
     anomaly_max_new_items: int = Field(default=10, ge=0)
     firecrawl_monthly_credit_cap: int = Field(default=900, ge=0)
 
+    # $ HTTP API and worker.$ 
+    api_token: str = ""
+    api_title: str = "LexCrawl API"
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    job_claim_lease_seconds: int = Field(default=900, ge=1)
+
     # $ Attachment (PDF) extraction retry cap and per-attachment size limit.$
     resource_extraction_attempts: int = Field(default=3, ge=1, le=20)
     resource_max_bytes: int = Field(default=20_000_000, gt=0)
     # $ How long a worker's claim on an attachment stays valid before it can be reclaimed.$
     resource_claim_lease_seconds: int = Field(default=300, ge=1)
+
+    # $ Retry pending documents independently of change detection, and reconcile periodically.$
+    document_extraction_attempts: int = Field(default=3, ge=1, le=20)
+    reconcile_interval_days: int = Field(default=7, ge=0)
 
 
 def required_setting(value: str, *, name: str) -> str:

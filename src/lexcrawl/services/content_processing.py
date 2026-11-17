@@ -22,7 +22,7 @@ from lexcrawl.db.session import session_scope
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import CanonicalDocument, compute_content_hash, ensure_text_marker
 from lexcrawl.pipeline.pdf import extract_pdf_text
-from lexcrawl.repositories.documents import upsert_document
+from lexcrawl.repositories.documents import upsert_document_with_status
 from lexcrawl.repositories.errors import PersistenceError
 from lexcrawl.repositories.resources import (
     ResourceClaim,
@@ -49,6 +49,8 @@ class PersistSummary:
     resources: int = 0
     extracted: int = 0
     failed: int = 0
+    inserted: int = 0
+    updated: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +88,7 @@ class ContentProcessingService:
         if not documents:
             return PersistSummary()
         now = datetime.now(tz=UTC)
-        claims, resources = self._stage(source, documents, now)
+        claims, resources, inserted, updated = self._stage(source, documents, now)
         results = [self._extract(claim) for claim in claims]
         if results:
             self._apply(results, now)
@@ -96,26 +98,36 @@ class ContentProcessingService:
             resources=resources,
             extracted=extracted,
             failed=len(results) - extracted,
+            inserted=inserted,
+            updated=updated,
         )
 
     def _stage(
         self, source: str, documents: Sequence[CanonicalDocument], now: datetime
-    ) -> tuple[list[ResourceClaim], int]:
+    ) -> tuple[list[ResourceClaim], int, int, int]:
         """### Short transaction: upsert rows and durably claim due attachments."""
         resources = 0
+        inserted = 0
+        updated = 0
         with session_scope(self._factory) as session:
             source_id = source_id_for(session, source)
             if source_id is None:
                 raise PersistenceError(f"source {source!r} is not registered; run the seed migration")
             document_ids: list[int] = []
             for document in documents:
-                document_id = upsert_document(session, source_id=source_id, document=document, now=now)
+                document_id, was_inserted = upsert_document_with_status(
+                    session, source_id=source_id, document=document, now=now
+                )
                 document_ids.append(document_id)
+                if was_inserted:
+                    inserted += 1
+                else:
+                    updated += 1
                 for resource in document.resources:
                     upsert_resource(session, document_id=document_id, resource=resource, now=now)
                     resources += 1
             if self._fetcher is None:
-                return [], resources
+                return [], resources, inserted, updated
             claims = claim_due_resources(
                 session,
                 attempt_cap=self._attempt_cap,
@@ -123,7 +135,7 @@ class ContentProcessingService:
                 now=now,
                 lease_seconds=self._lease_seconds,
             )
-            return claims, resources
+            return claims, resources, inserted, updated
 
     def _extract(self, claim: ResourceClaim) -> _ExtractionResult:
         """### Fetch and extract one attachment with no transaction held."""

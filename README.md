@@ -15,14 +15,23 @@ API, and scheduling are planned next.
 | Commerce reports (Firecrawl → parse → canonical JSON) | Implemented |
 | UAE Legislation news (direct fetch → Firecrawl fallback → parse → canonical JSON) | Implemented |
 | Change detection for all sources (`lexcrawl check`) | Implemented |
+| Change-detection checkpoints (`source_checkpoints`, observed vs processed) | Implemented |
+| Crawl monitoring orchestrator (retry-pending + periodic reconciliation) | Implemented |
 | Daily incremental run (`lexcrawl daily`): probe → crawl only changes | Implemented |
+| Observability: `crawl_runs` + `crawl_run_sources` + `crawl_errors` + views | Implemented |
+| Read/query layer (keyset pagination, detail, runs, resources) | Implemented |
+| Credit accounting (actual + reserved, DB-authoritative) | Implemented |
+| Advisory-lock run coordination + durable job queue + worker | Implemented |
+| API response contracts (models only; routes not started) | Implemented |
+| Per-source failure isolation (one source can't abort the others) | Implemented |
 | Daily scheduler (`lexcrawl schedule`, APScheduler) + run lock | Implemented |
 | Anomaly guard + monthly credit budget governor | Implemented |
 | PostgreSQL persistence (`sources`, `documents`, `document_resources`) | Implemented |
 | Content processing service + PDF extraction pipeline (opt-in) | Implemented |
 | PDF attachment extraction wired live per source | Not started (dormant until a byte fetcher is provided) |
-| FastAPI + Swagger UI | Not started |
-| Docker Compose | Not started |
+| FastAPI API (reads + job submission; Swagger at /docs) | Implemented |
+| Docker Compose (db + api + worker) | Implemented |
+| GitHub Actions daily crawl (00:00 UTC) | Implemented |
 
 ## Layout
 
@@ -59,7 +68,8 @@ src/lexcrawl/
 ├── factory.py         # composition root: builds checks, actors, scrapers, memory
 ├── cli.py             # `lexcrawl crawl` / `check` / `daily` / `schedule`
 ├── db/                # SQLAlchemy models, engine, sessions
-├── repositories/      # idempotent reads/writes + the DB identity memory
+├── api/               # response contracts (pre-FastAPI)
+├── repositories/      # idempotent writes, bounded reads, jobs, accounting
 ├── services/          # content processing: persistence + attachment extraction
 ├── pipeline/          # normalization + PDF text extraction
 └── migrations/        # Alembic migrations
@@ -142,12 +152,51 @@ Phase 2 adds `document_resources` and a `ContentProcessingService` that persists
 its attachments and drives **per-attachment** extraction: each PDF is processed independently, with
 its own status, attempts, and `last_extracted_at`, retried up to `RESOURCE_EXTRACTION_ATTEMPTS`
 (default 3) and then left in a terminal `failed` state. Normalization/validation/hashing stay in the
-canonical models; the service only orchestrates. Network fetching runs **outside** any DB
+canonical models; the service only orchestrates. One SQLAlchemy engine per process is shared by
+document memory, the checkpoint store, and the run recorder via `build_runtime`. Network fetching runs **outside** any DB
 transaction; claims are **durable** (`claimed_at` + `RESOURCE_CLAIM_LEASE_SECONDS`) so other
 workers/hosts skip a row already being fetched and a crashed claim expires; the byte cap
 (`RESOURCE_MAX_BYTES`) is enforced by the fetcher **while streaming**; and attachment errors are
 redacted before being logged or stored. PDF extraction is **dormant** until a per-source fetcher is
 wired in (so we don't spend Firecrawl PDF credits by default).
+
+**Attachment (PDF) policy:** extraction is opt-in. To enable it, construct a per-source
+`ResourceFetcher` (`HttpResourceFetcher` streams and aborts past `RESOURCE_MAX_BYTES`) and pass it to
+`DbDocumentMemory`. Cost note: Firecrawl parses PDFs at **1 credit per PDF page**, so enable it
+selectively and gate by page count; until then attachments are stored as metadata with status
+`pending` and retried up to `RESOURCE_EXTRACTION_ATTEMPTS`.
+
+## Observability
+
+Every execution writes exactly one `crawl_runs` row (trigger, status, duration, credits) and one
+`crawl_run_sources` row per source (check outcome, status, discovered/inserted/updated/skipped/failed
+counts, resource count, pending backlog, credits, pagination, timing). Sanitized errors go to
+`crawl_errors` (stage + type + redacted message). Two views support reporting:
+`v_pending_documents` (retryable documents) and `v_monthly_credit_usage` (per-source credits derived
+from run records — no drifting counter). Structured logs carry `run_id` and `crawl_run_source_id` so
+application output correlates with the database. The run record is finalized even if execution
+throws. Rows recorded before fine-grained metrics existed are marked `metrics_known = false`
+(status `unknown`) by a follow-up migration; migrations are append-only (applied files are not
+rewritten).
+
+## Change detection (Phase 3)
+
+`source_checkpoints` stores, per source, the **observed** fingerprint (what the last probe saw)
+and the **processed** fingerprint (what has actually been ingested). Decisions compare against
+**processed**, so a probe that sees a change cannot mask a failed ingest:
+
+- `no_change` → skip the crawl.
+- `new_data` → run the actor; advance **processed** only after the discovery set is persisted and
+  nothing is left pending (per-document extraction failures retry via a due-count, not by holding
+  the checkpoint back forever).
+- `check_failed` → fail safe: never treated as `no_change`, never triggers a crawl.
+- `--force` / `--bootstrap` bypass the comparison.
+- Pending documents are retried independently of new-data detection, and a **periodic
+  reconciliation** (`RECONCILE_INTERVAL_DAYS`) re-crawls after a long gap because a head+count
+  fingerprint cannot catch every mid-list edit.
+
+Monitors are `checks/*` (freedom: CBA sitemap, UAE listing, Commerce listing head+count); the
+orchestrator is `checks/runner.run_daily`; fingerprints live in `checks/fingerprints.py`.
 
 ## Scheduler and guards
 
@@ -166,6 +215,45 @@ Two guards run during `daily`:
   is skipped — the probe still runs — with a `budget_exceeded` outcome and an alert.
 
 Alerts are structured logs today (`alerts.notify`), with a hook for a webhook/email later.
+
+## API and scheduling
+
+```bash
+uv run lexcrawl serve --port 8000      # FastAPI + Swagger at /docs
+uv run lexcrawl worker                 # claims queued jobs (or --once)
+docker compose up --build              # db + migrate + api + worker
+```
+
+**Authentication policy:** every endpoint except the health probes (`/healthz`, `/readyz`) requires
+`Authorization: Bearer <API_TOKEN>`. Auth is constant-time; if `API_TOKEN` is unset the API returns
+`503`, and missing/invalid tokens return `401`.
+
+Read endpoints (repository-backed, no SQL in handlers): `GET /sources`, `/sources/{code}`,
+`/documents` (filters + cursor + `limit<=200`, **never** returns `text`), `/documents/{id}`,
+`/documents/{id}/resources`, `/documents/{id}/text`, `/runs`, `/runs/{run_id}` (errors bounded by
+`error_limit<=500`, with `errors_total`), `/analytics/credits`, `/analytics/pending`.
+
+`POST /jobs` validates source codes, accepts `Idempotency-Key` (≤128 chars), returns **202** with a
+`run_id`, and **409** when a job is already active. Single-active execution is enforced atomically by
+a PostgreSQL partial unique index on `jobs` (plus the advisory lock during the crawl). The worker
+claims jobs with `SKIP LOCKED`, holds the advisory lock, and executes `run_daily`. GitHub Actions runs
+`lexcrawl daily --source all` daily and via `workflow_dispatch`.
+
+## Pre-API hardening
+
+- **Reads** (`repositories/reads.py`): bounded keyset pagination (`published_at DESC NULLS LAST,
+  id DESC`), filter-bound cursors, list projections without `text`, and explicit detail/resources/
+  sources/runs/errors queries.
+- **Indexes**: `(source_id, published_at DESC NULLS LAST, id DESC)`, `(published_at DESC NULLS
+  LAST, id DESC)`, `GIN(topics)` — validated with `EXPLAIN` (the list query uses an index-only scan).
+- **Credits** (`services/credit_accounting.py`): actual + reserved from PostgreSQL; the governor and
+  analytics share it. The JSON `UsageStore` remains only for `STATE_BACKEND=json`.
+- **Run coordination** (`locking.AdvisoryLock`): a session-level PostgreSQL advisory lock held on a
+  dedicated connection for the whole crawl; the scheduler and worker share the key.
+- **Job queue** (`jobs` table + `repositories/jobs.py`): idempotent enqueue, `SKIP LOCKED` claim,
+  stale-claim reclaim; `lexcrawl worker` claims and executes jobs (`--once` or loop).
+- **Contracts** (`api/contracts.py`): list/detail/run response models, pagination envelope, error
+  and job-accepted envelopes — defined ahead of the FastAPI routes.
 
 ## Source access
 

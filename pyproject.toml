@@ -19,6 +19,8 @@ dependencies = [
     "alembic>=1.13,<2.0",
     "psycopg[binary]>=3.2,<4.0",
     "pymupdf>=1.24,<2.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
 ]
 
 [project.scripts]
@@ -52,6 +54,9 @@ extend-exclude = [".agents", ".claude", ".grok", ".kilo", "migrations"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "PTH", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
 
 [tool.mypy]
 python_version = "3.12"

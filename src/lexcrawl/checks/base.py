@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Literal
 
 # $ The verdict a gate derives from a probe and the stored watermark.$
-CheckOutcome = Literal["no_change", "new_data", "check_failed", "anomaly", "budget_exceeded"]
+CheckOutcome = Literal["no_change", "new_data", "check_failed", "anomaly", "budget_exceeded", "failed"]
 
 
 @dataclass(frozen=True, slots=True)

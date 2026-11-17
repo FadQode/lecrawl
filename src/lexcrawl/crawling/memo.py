@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from lexcrawl.crawling.scrape import ScrapedPage, Scraper
 
 
@@ -22,7 +24,8 @@ class MemoizingScraper:
         """### Return the page fetched earlier this run, or fetch and remember it."""
         existing = self._pages.get(url)
         if existing is not None:
-            return existing
+            # $ A cache hit costs no credits; report zero so accounting isn't double-counted.$
+            return replace(existing, credits_used=0, cached=True)
         page = self._inner.scrape(url, cache=cache)
         self._pages[url] = page
         return page
