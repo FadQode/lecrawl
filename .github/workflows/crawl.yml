@@ -1,8 +1,8 @@
 name: daily-crawl
 
+# $ The daily cron is owned by the in-app scheduler (`lexcrawl schedule`); this workflow is an
+# $ on-demand trigger only, so a shared database is never crawled twice a day.
 on:
-  schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC = 07:00 WIB
   workflow_dispatch:
 
 concurrency:
@@ -16,7 +16,6 @@ jobs:
     # $ external PostgreSQL (DATABASE_URL secret) rather than an ephemeral service container.
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      STATE_BACKEND: db
       FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
       CRAWL_USER_AGENT: ${{ vars.CRAWL_USER_AGENT || 'LexCrawl/0.1' }}
       LISTINGS_URL: https://uaelegislation.gov.ae/ar/news

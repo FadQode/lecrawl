@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
@@ -12,7 +11,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
-from lexcrawl.actors.base import Actor, ActorRunResult
+from lexcrawl.actors.base import Actor, ActorRunResult, KnownFilter, partition_known
 from lexcrawl.config import required_setting
 from lexcrawl.crawling.base import AccessBlockedError, AccessDeniedError, Fetcher, FetchError
 from lexcrawl.logging import get_logger
@@ -323,7 +322,7 @@ class CbaNewsReleasesActor(Actor):
         page_size: int = 50,
         max_pages: int = 10,
         source_name: str = SOURCE_NAME,
-        is_known: Callable[[str], bool] | None = None,
+        is_known: KnownFilter | None = None,
         max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing feed and the enrichment bounds."""
@@ -414,8 +413,11 @@ class CbaNewsReleasesActor(Actor):
         if not state.discovered:
             result.add_error("no news releases matched the listing feed")
             return
-        pending = [record for record in state.discovered.values() if not self._is_known_record(record)]
-        result.records_skipped_known += len(state.discovered) - len(pending)
+        pending, skipped = partition_known(
+            [(stable_identity(self.source_name, None, record.url), record) for record in state.discovered.values()],
+            self._is_known,
+        )
+        result.records_skipped_known += skipped
         if self._max_new_items is not None and len(pending) > self._max_new_items:
             result.anomaly_detected = True
             result.add_error(
@@ -425,10 +427,6 @@ class CbaNewsReleasesActor(Actor):
         for record in pending:
             result.detail_pages_attempted += 1
             self._enrich_record(fetcher, record, result)
-
-    def _is_known_record(self, record: CbaRecord) -> bool:
-        """### Report whether a release identity was already ingested."""
-        return self._is_known is not None and self._is_known(stable_identity(self.source_name, None, record.url))
 
     def _enrich_record(self, fetcher: Fetcher, record: CbaRecord, result: ActorRunResult) -> None:
         """### Fetch, parse and canonicalize one release without affecting siblings."""

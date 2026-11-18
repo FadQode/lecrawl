@@ -15,9 +15,19 @@ def mask_dsn(url: str | URL) -> str:
     return parsed.render_as_string(hide_password=True)
 
 
+def resolve_database_url(settings: Settings) -> str:
+    """### Return the configured DSN (delegates to `Settings.database_dsn`)."""
+    return settings.database_dsn()
+
+
+def database_configured(settings: Settings) -> bool:
+    """### Report whether a database DSN can be resolved."""
+    return bool(settings.database_dsn().strip())
+
+
 def create_db_engine(settings: Settings) -> Engine:
     """### Build a lazy SQLAlchemy engine from validated settings."""
-    url = make_url(settings.database_url)
+    url = make_url(settings.require_database_url())
     options: dict[str, object] = {"echo": settings.db_echo, "pool_pre_ping": True}
     if url.get_backend_name() == POSTGRESQL_BACKEND:
         # $ PostgreSQL keeps a bounded pool and an explicit connection timeout.$

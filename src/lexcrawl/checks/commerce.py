@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from lexcrawl.actors.commerce import SOURCE_NAME, build_page_url, parse_listing
 from lexcrawl.checks.base import Check, CheckProbe
 from lexcrawl.checks.fingerprints import commerce_fingerprint
-from lexcrawl.crawling.scrape import ScrapeError, Scraper
+from lexcrawl.crawling.scrape import BudgetExceededError, ScrapeError, Scraper
 from lexcrawl.logging import get_logger
 
 LOGGER = get_logger(__name__)
@@ -39,6 +39,8 @@ class CommerceCheck(Check):
         page_url = build_page_url(self._listing_url, 0)
         try:
             scraped = self._scraper.scrape(page_url)
+        except BudgetExceededError:
+            raise
         except ScrapeError as error:
             return self._failed(started_at, f"listing fetch failed: {error}")
         if scraped.target_status is not None and scraped.target_status >= 400:

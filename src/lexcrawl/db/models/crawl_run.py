@@ -37,7 +37,7 @@ class CrawlRun(Base):
             "trigger_type IN ('scheduled', 'manual', 'force', 'bootstrap', 'api')", name="trigger_type_values"
         ),
         CheckConstraint(
-            "status IN ('running', 'success', 'partial_failure', 'failed')", name="status_values"
+            "status IN ('running', 'success', 'partial_failure', 'failed', 'abandoned')", name="status_values"
         ),
         Index("ix_crawl_runs_started_at", sql_text("started_at DESC")),
     )

@@ -15,6 +15,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # $ Run as a non-root user.$
 RUN useradd --create-home --uid 10001 app && chown -R app:app /app
+# $ Create the state/cache dir owned by app so a mounted volume is writable.$
+RUN mkdir -p /app/data && chown app:app /app/data
 USER app
 
 EXPOSE 8000

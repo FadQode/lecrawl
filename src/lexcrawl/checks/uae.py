@@ -7,7 +7,7 @@ import time
 from lexcrawl.actors.uae_legislation import SOURCE_NAME, article_scope, parse_listing
 from lexcrawl.checks.base import Check, CheckProbe
 from lexcrawl.checks.fingerprints import uae_fingerprint
-from lexcrawl.crawling.scrape import ScrapeError, Scraper
+from lexcrawl.crawling.scrape import BudgetExceededError, ScrapeError, Scraper
 from lexcrawl.logging import get_logger
 
 LOGGER = get_logger(__name__)
@@ -35,6 +35,8 @@ class UaeCheck(Check):
         started_at = time.monotonic()
         try:
             scraped = self._scraper.scrape(self._listing_url)
+        except BudgetExceededError:
+            raise
         except ScrapeError as error:
             return self._failed(started_at, f"listing fetch failed: {error}")
         if scraped.target_status is not None and scraped.target_status >= 400:

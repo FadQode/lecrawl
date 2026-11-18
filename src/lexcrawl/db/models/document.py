@@ -82,6 +82,11 @@ class Document(Base):
         ),
         Index("ix_documents_published_id", sql_text("published_at DESC NULLS LAST"), sql_text("id DESC")),
         Index("ix_documents_topics", "topics", postgresql_using="gin"),
+        Index(
+            "ix_documents_due",
+            "source_id",
+            postgresql_where=sql_text("extraction_status IN ('pending', 'failed')"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from lexcrawl.db.models import DocumentResource
+from lexcrawl.db.models import Document, DocumentResource
 from lexcrawl.models.document import DocumentResource as CanonicalResource
 
 COMPLETE = "complete"
@@ -82,13 +82,21 @@ def claim_due_resources(
     session: Session,
     *,
     attempt_cap: int,
-    document_ids: Sequence[int],
+    document_ids: Sequence[int] | None = None,
+    source_id: int | None = None,
     now: datetime,
     lease_seconds: int = 300,
     limit: int | None = None,
+    all_sources: bool = False,
 ) -> list[ResourceClaim]:
-    """### Atomically claim due PDF attachments, recording a durable lease."""
-    if not document_ids:
+    """### Atomically claim due PDF attachments, recording a durable lease.
+
+    Pass `all_sources=True` for the standalone resource queue, which claims across
+    every source rather than a single document set or source.
+    """
+    if document_ids is not None and not document_ids:
+        return []
+    if document_ids is None and source_id is None and not all_sources:
         return []
     cutoff = now - timedelta(seconds=max(1, lease_seconds))
     statement = (
@@ -98,13 +106,18 @@ def claim_due_resources(
             DocumentResource.status.in_(RETRYABLE_STATUSES),
             DocumentResource.attempts < attempt_cap,
             DocumentResource.url.is_not(None),
-            DocumentResource.document_id.in_(document_ids),
             # $ Skip rows another worker is fetching, unless its lease has expired.$
             or_(DocumentResource.claimed_at.is_(None), DocumentResource.claimed_at < cutoff),
         )
         .order_by(DocumentResource.id)
         .with_for_update(skip_locked=True)
     )
+    if document_ids is not None:
+        statement = statement.where(DocumentResource.document_id.in_(document_ids))
+    elif source_id is not None:
+        statement = statement.where(
+            DocumentResource.document_id.in_(select(Document.id).where(Document.source_id == source_id))
+        )
     if limit is not None:
         statement = statement.limit(limit)
     claims: list[ResourceClaim] = []

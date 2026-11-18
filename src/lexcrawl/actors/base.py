@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
@@ -10,6 +11,24 @@ from lexcrawl.crawling.base import Fetcher
 from lexcrawl.models.document import CanonicalDocument
 
 RunStatus = Literal["success", "partial_failure", "failed"]
+
+# $ Actors ask the memory which candidate identities are already ingested in one batch.$
+KnownFilter = Callable[[Sequence[str]], Collection[str]]
+
+
+def partition_known[T](
+    items: Sequence[tuple[str, T]], is_known: KnownFilter | None
+) -> tuple[list[T], int]:
+    """### Split `(identity, item)` pairs into new items and a skipped count.
+
+    A single batched lookup per page replaces the old per-record predicate, so the
+    memory can answer with one `identity_key = ANY(:keys)` query.
+    """
+    if is_known is None:
+        return [item for _, item in items], 0
+    known = set(is_known([key for key, _ in items]))
+    new_items = [item for key, item in items if key not in known]
+    return new_items, len(items) - len(new_items)
 
 
 @dataclass(slots=True)

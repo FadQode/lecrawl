@@ -29,15 +29,15 @@ class Job(Base):
 
     __tablename__ = "jobs"
     __table_args__ = (
-        UniqueConstraint("idempotency_key"),
+        UniqueConstraint("idempotency_key", "source"),
         CheckConstraint(
             "status IN ('queued', 'claimed', 'running', 'succeeded', 'failed', 'rejected')",
             name="status_values",
         ),
         Index("ix_jobs_status_created_at", "status", "created_at"),
         Index(
-            "uq_jobs_single_active",
-            sql_text("(1)"),
+            "uq_jobs_active_per_source",
+            "source",
             unique=True,
             postgresql_where=sql_text("status IN ('queued', 'claimed', 'running')"),
         ),
@@ -46,7 +46,10 @@ class Job(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid, unique=True, nullable=False)
     trigger_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    # $ One job per source; NULL marks a legacy whole-run job from before per-source fan-out.$
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, server_default=sql_text("'queued'"))
+    result_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

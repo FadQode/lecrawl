@@ -35,6 +35,14 @@ class FakeScraper:
             credits_used=0,
         )
 
+    def store(self, url: str, page: ScrapedPage) -> None:
+        """### No-op cache store."""
+        return None
+
+    def evict(self, url: str) -> None:
+        """### No-op cache eviction."""
+        return None
+
     def close(self) -> None:
         """### No-op close."""
         return None

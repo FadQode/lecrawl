@@ -17,26 +17,26 @@ from sqlalchemy import Engine
 
 from lexcrawl.alerts import ANOMALY, BUDGET_EXCEEDED, CHECK_FAILED, notify
 from lexcrawl.checks.base import CheckOutcome
-from lexcrawl.checks.budget import CreditBudget, build_credit_budget
+from lexcrawl.checks.budget import CreditBudget, build_credit_budget, current_period
 from lexcrawl.checks.change_detection import ChangeDetectionService, Decision
 from lexcrawl.checks.checkpoints import CheckpointStore
 from lexcrawl.checks.identities import DocumentMemory, RememberResult
 from lexcrawl.checks.run_records import RunHandle, RunRecorder
-from lexcrawl.checks.usage import current_period
 from lexcrawl.config import Settings
 from lexcrawl.crawling.base import redact_message
 from lexcrawl.crawling.memo import MemoizingScraper
+from lexcrawl.crawling.scrape import BudgetExceededError
 from lexcrawl.factory import (
     CHECK_SOURCES,
-    CREDIT_SOURCES,
     build_actor,
     build_check,
     build_http_fetcher,
     build_runtime,
     build_scraper,
 )
-from lexcrawl.locking import AdvisoryLock, RunInProgressError
+from lexcrawl.locking import AdvisoryLock, RunInProgressError, advisory_lock_key_for
 from lexcrawl.logging import get_logger
+from lexcrawl.metrics import record_source_run
 
 if TYPE_CHECKING:
     from lexcrawl.actors.base import ActorRunResult
@@ -88,44 +88,71 @@ def run_daily(
 ) -> list[DailySourceResult]:
     """### Probe each source, crawl what needs it, and record the run."""
     runtime = build_runtime(settings, engine=engine)
-    advisory = AdvisoryLock(runtime.engine) if (record and runtime.engine is not None) else None
     results: list[DailySourceResult] = []
     run_status = "failed"
     started_at = datetime.now(tz=UTC)
     handle: RunHandle | None = None
+    locks: dict[str, AdvisoryLock] = {}
     try:
-        if advisory is not None and not advisory.acquire():
-            raise RunInProgressError("another crawl run is active")
+        # $ Hold each source's lock for the whole run so liveness is observable and
+        # $ a crash releases them automatically (the connections close).$
+        if record:
+            _acquire_source_locks(runtime.engine, sources, locks)
         checkpoints = runtime.checkpoints
         memory = runtime.memory
         recorder = runtime.recorder
-        budget = build_credit_budget(settings, engine=runtime.engine)
+        budget = build_credit_budget(runtime.engine)
         period = current_period()
         effective_trigger = "bootstrap" if bootstrap else "force" if force else trigger
         handle = recorder.start(effective_trigger, run_id=run_id) if record else None
         for name in sources:
-            result = _safe_run_source(
-                name,
-                settings,
-                checkpoints,
-                memory,
-                budget,
-                period,
-                force=force,
-                bootstrap=bootstrap,
-                record=record,
-            )
+            if record and name not in locks:
+                # $ Only reachable for multi-source runs; single-source runs raised above.$
+                result = _result(
+                    name,
+                    "no_change",
+                    status="partial_failure",
+                    started_at=datetime.now(tz=UTC),
+                    started_mono=time.monotonic(),
+                    detail="another run is already active for this source",
+                )
+            else:
+                result = _safe_run_source(
+                    name,
+                    settings,
+                    checkpoints,
+                    memory,
+                    budget,
+                    period,
+                    force=force,
+                    bootstrap=bootstrap,
+                    record=record,
+                )
             results.append(result)
+            _record_metrics(result)
             if record and handle is not None:
                 _record_source(recorder, handle, result)
         run_status = _aggregate_status(results)
         return results
     finally:
+        # $ Finalize while the locks are still held: otherwise a polling worker could see a
+        # $ 'running' run with no lock and mark it abandoned in the gap.$
         if record and handle is not None:
             _finalize(recorder, handle, run_status, results, started_at)
-        if advisory is not None:
-            advisory.release()
+        for lock in locks.values():
+            lock.release()
         runtime.close()
+
+
+def _record_metrics(result: DailySourceResult) -> None:
+    """### Publish one source's outcome to the process metrics registry."""
+    record_source_run(
+        source=result.source,
+        status=result.status,
+        duration_seconds=result.duration_seconds,
+        credits=result.credits,
+        failed=result.failed,
+    )
 
 
 def _record_source(recorder: RunRecorder, handle: RunHandle, result: DailySourceResult) -> None:
@@ -188,6 +215,20 @@ def _finalize(
         )
     except Exception:  # $ Never let run finalization mask the original failure.$
         LOGGER.exception("run_finalize_failed")
+
+
+def _acquire_source_locks(engine: Engine, sources: tuple[str, ...], locks: dict[str, AdvisoryLock]) -> None:
+    """### Acquire one advisory lock per source, raising when a single-source run is busy.
+
+    Multi-source runs keep the sources they could lock and report the contended ones as
+    skipped, so one busy source never blocks the rest.
+    """
+    for name in sources:
+        lock = AdvisoryLock(engine, key=advisory_lock_key_for(name))
+        if lock.acquire():
+            locks[name] = lock
+        elif len(sources) == 1:
+            raise RunInProgressError(f"another run is already active for source {name!r}")
 
 
 def _safe_run_source(
@@ -254,13 +295,26 @@ def _run_source(
 ) -> DailySourceResult:
     """### Run one source: probe, decide, and crawl when required."""
     bypass = force or bootstrap
-    scraper = build_scraper(name, settings)
+    scraper = build_scraper(
+        name, settings, budget=budget, period=period, cap=settings.firecrawl_monthly_credit_cap
+    )
     memo = MemoizingScraper(scraper) if scraper is not None else None
     http_fetcher = build_http_fetcher(settings)
     try:
         check = build_check(name, settings, scraper=memo, http_fetcher=http_fetcher)
         key = check.name
-        probe = check.probe()
+        try:
+            probe = check.probe()
+        except BudgetExceededError:
+            notify(BUDGET_EXCEEDED, "monthly provider credit cap reached; crawl skipped", source=key)
+            return _result(
+                key,
+                "budget_exceeded",
+                status="partial_failure",
+                started_at=started_at,
+                started_mono=started_mono,
+                detail="monthly provider credit cap reached",
+            )
         if record and probe.credits_used:
             budget.record(period, probe.credits_used)
             credit_counter.total += probe.credits_used
@@ -268,6 +322,12 @@ def _run_source(
         detector = ChangeDetectionService(checkpoints, record=record)
         decision = detector.decide(key, probe, force=bypass)
         outcome = decision.outcome
+        if record:
+            # $ Retry due attachments on every run, even when no new data was detected.$
+            try:
+                memory.retry_due(key)
+            except Exception:
+                LOGGER.warning("resource_retry_sweep_failed", extra={"source": key})
 
         if outcome == "check_failed":
             notify(CHECK_FAILED, "change check failed", source=key, reason=probe.error)
@@ -295,35 +355,14 @@ def _run_source(
                 detail=probe.summary,
             )
 
-        if _budget_exceeded(name, settings, budget, period, bypass):
-            spent = budget.committed(period)
-            detail = f"{probe.summary}; spent={spent}/{settings.firecrawl_monthly_credit_cap}"
-            notify(
-                BUDGET_EXCEEDED,
-                "monthly provider credit cap reached; crawl skipped",
-                source=key,
-                spent=spent,
-                cap=settings.firecrawl_monthly_credit_cap,
-            )
-            return _result(
-                key,
-                "budget_exceeded",
-                status="partial_failure",
-                started_at=started_at,
-                started_mono=started_mono,
-                credits=probe.credits_used,
-                errors=(detail,),
-                detail=detail,
-            )
-
-        known = memory.known(key)
-        max_new = _anomaly_limit(settings, known, bypass) if outcome == "new_data" else None
+        has_baseline = memory.has_baseline(key)
+        max_new = _anomaly_limit(settings, has_baseline=has_baseline, bypass=bypass) if outcome == "new_data" else None
         actor = build_actor(
             name,
             settings,
             scraper=memo,
             http_fetcher=http_fetcher,
-            is_known=known.__contains__,
+            is_known=lambda keys: memory.filter_known(key, keys),
             max_new_items=max_new,
         )
         run = actor.run(http_fetcher)
@@ -404,6 +443,9 @@ def _source_status(outcome: CheckOutcome, run: ActorRunResult | None) -> str:
         return "partial_failure"
     if run is None:
         return "success" if outcome == "no_change" else "partial_failure"
+    if len(run.documents) == 0 and run.records_skipped_known == 0:
+        # $ Nothing ingested and nothing skipped means the crawl failed outright.$
+        return "failed"
     clean = (
         run.pagination_complete
         and run.records_without_text == 0
@@ -411,11 +453,7 @@ def _source_status(outcome: CheckOutcome, run: ActorRunResult | None) -> str:
         and run.detail_pages_failed == 0
         and run.listing_pages_failed == 0
     )
-    if clean:
-        return "success"
-    if run.documents or run.records_skipped_known:
-        return "partial_failure"
-    return "failed"
+    return "success" if clean else "partial_failure"
 
 
 def _aggregate_status(results: list[DailySourceResult]) -> str:
@@ -438,17 +476,9 @@ def _reconcile_due(decision: Decision, settings: Settings) -> bool:
     return datetime.now(tz=UTC) - decision.processed_at >= timedelta(days=interval)
 
 
-def _budget_exceeded(
-    name: str, settings: Settings, budget: CreditBudget, period: str, bypass: bool
-) -> bool:
-    """### Report whether a credit-bearing source has exhausted its monthly budget."""
-    cap = settings.firecrawl_monthly_credit_cap
-    return not bypass and name in CREDIT_SOURCES and cap > 0 and budget.committed(period) >= cap
-
-
-def _anomaly_limit(settings: Settings, known: frozenset[str], bypass: bool) -> int | None:
+def _anomaly_limit(settings: Settings, *, has_baseline: bool, bypass: bool) -> int | None:
     """### Apply the anomaly limit only on incremental runs with an existing baseline."""
-    if bypass or not known or settings.anomaly_max_new_items <= 0:
+    if bypass or not has_baseline or settings.anomaly_max_new_items <= 0:
         return None
     return settings.anomaly_max_new_items
 

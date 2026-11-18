@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from threading import Lock
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -86,26 +88,62 @@ def retry_delay(attempt: int, *, backoff_seconds: float, retry_after_seconds: fl
     return min(base * (1 + random.random() * 0.25), 60.0)
 
 
-class RequestPacer:
-    """### Enforce a minimum delay between successive outgoing requests."""
+class HostPacer:
+    """### Enforce a minimum delay between requests to each host.
 
-    def __init__(self, delay_seconds: float, *, sleep: Callable[[float], None], monotonic: Callable[[], float]) -> None:
-        """### Store the pacing delay and injectable clock."""
-        self._delay_seconds = max(0.0, delay_seconds)
+    Pacing is keyed by hostname rather than by fetcher, so strategies **within one process**
+    share a cadence. It is not a cross-process rate limiter: separate worker containers each
+    pace independently. Access is serialized with a lock because the shared pacer may be used
+    from more than one thread (for example the worker loop and its heartbeat).
+    """
+
+    def __init__(
+        self, *, sleep: Callable[[float], None] = time.sleep, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        """### Store the sleep/clock hooks used to space requests."""
         self._sleep = sleep
         self._monotonic = monotonic
-        self._last_request_at: float | None = None
+        self._last_request_at: dict[str, float] = {}
+        self._lock = Lock()
 
-    def wait_for_slot(self) -> None:
-        """### Sleep just long enough to honour the configured request spacing."""
-        if self._delay_seconds <= 0:
+    def wait_for_slot(self, host: str, delay_seconds: float) -> None:
+        """### Sleep just long enough to honour the per-host request spacing."""
+        if delay_seconds <= 0:
             return
-        now = self._monotonic()
-        if self._last_request_at is not None:
-            remaining = self._delay_seconds - (now - self._last_request_at)
-            if remaining > 0:
-                self._sleep(remaining)
-        self._last_request_at = self._monotonic()
+        with self._lock:
+            now = self._monotonic()
+            last = self._last_request_at.get(host)
+            if last is not None:
+                remaining = delay_seconds - (now - last)
+                if remaining > 0:
+                    self._sleep(remaining)
+            self._last_request_at[host] = self._monotonic()
+
+
+class LruCache[K, V]:
+    """### A tiny bounded LRU map so caches cannot grow without limit."""
+
+    def __init__(self, max_entries: int) -> None:
+        """### Bound the cache to a fixed number of entries (0 disables caching)."""
+        self._max_entries = max(0, max_entries)
+        self._store: OrderedDict[K, V] = OrderedDict()
+
+    def get(self, key: K) -> V | None:
+        """### Return a cached value and mark it recently used."""
+        value = self._store.get(key)
+        if value is None:
+            return None
+        self._store.move_to_end(key)
+        return value
+
+    def put(self, key: K, value: V) -> None:
+        """### Insert a value, evicting the least-recently-used entry when full."""
+        if self._max_entries <= 0:
+            return
+        self._store[key] = value
+        self._store.move_to_end(key)
+        while len(self._store) > self._max_entries:
+            self._store.popitem(last=False)
 
 
 class HttpFetcher:
@@ -124,8 +162,12 @@ class HttpFetcher:
         max_response_bytes: int = 26_214_400,
         allowed_redirect_hosts: tuple[str, ...] = (),
         allowed_hosts: tuple[str, ...] = (),
+        allowed_suffixes: tuple[str, ...] = (),
+        enable_cache: bool = True,
+        max_cache_entries: int = 256,
         max_redirects: int = 5,
         client: httpx.Client | None = None,
+        host_pacer: HostPacer | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -137,10 +179,13 @@ class HttpFetcher:
         self._max_response_bytes = max(1, max_response_bytes)
         self._allowed_redirect_hosts = tuple(host.lower().rstrip(".") for host in allowed_redirect_hosts)
         self._allowed_hosts = tuple(host.lower().rstrip(".") for host in allowed_hosts)
+        self._allowed_suffixes = tuple(suffix.lower().rstrip(".") for suffix in allowed_suffixes)
+        self._enable_cache = enable_cache
         self._max_redirects = max(0, max_redirects)
         self._sleep = sleep
-        self._pacer = RequestPacer(request_delay_seconds, sleep=sleep, monotonic=monotonic)
-        self._cache: dict[tuple[str, bool, int], FetchedPage] = {}
+        self._request_delay_seconds = max(0.0, request_delay_seconds)
+        self._pacer = host_pacer or HostPacer(sleep=sleep, monotonic=monotonic)
+        self._cache: LruCache[tuple[str, bool, int], FetchedPage] = LruCache(max_cache_entries)
         self._logger = get_logger(__name__)
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(timeout_seconds),
@@ -188,15 +233,22 @@ class HttpFetcher:
         )
 
     def _fetch_cached(self, url: str, *, require_text: bool, max_bytes: int | None = None) -> FetchedPage:
-        """### Fetch a URL once per run, applying the retry policy."""
+        """### Fetch a URL once per run, applying the retry policy.
+
+        Only textual responses are cached: binary payloads (PDFs and other
+        attachments) are large and rarely re-requested, so caching them would
+        hold tens of megabytes in memory for the whole run.
+        """
         limit = min(max_bytes, self._max_response_bytes) if max_bytes is not None else self._max_response_bytes
+        if not (self._enable_cache and require_text):
+            return self._request_with_retries("GET", url, require_text=require_text, max_bytes=limit)
         cache_key = (url, require_text, limit)
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._logger.debug("fetch_cache_hit", extra={"url": redact_url(validate_http_url(url))})
             return cached
         page = self._request_with_retries("GET", url, require_text=require_text, max_bytes=limit)
-        self._cache[cache_key] = page
+        self._cache.put(cache_key, page)
         return page
 
     def _request_with_retries(
@@ -249,7 +301,7 @@ class HttpFetcher:
         headers: dict[str, str] | None = None,
     ) -> FetchedPage:
         """### Stream a bounded response and validate every redirect before following it."""
-        validate_http_url(url, allowed_hosts=self._allowed_hosts)
+        validate_http_url(url, allowed_hosts=self._allowed_hosts, allowed_suffixes=self._allowed_suffixes)
         original_host = urlparse(url).hostname or ""
         allowed_hosts = (*self._allowed_redirect_hosts, original_host.lower().rstrip("."))
         current_url = url
@@ -289,7 +341,7 @@ class HttpFetcher:
         headers: dict[str, str] | None,
     ) -> tuple[FetchedPage, str | None]:
         """### Issue one paced streaming request with a strict body-size limit."""
-        self._pacer.wait_for_slot()
+        self._pacer.wait_for_slot(urlparse(url).hostname or "", self._request_delay_seconds)
         try:
             with self._client.stream(method, url, content=content, headers=headers) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:

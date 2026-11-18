@@ -154,12 +154,19 @@ class ErrorEnvelope(BaseModel):
     instance: str | None = None
 
 
-class JobAccepted(BaseModel):
-    """### Response for an accepted crawl job (202)."""
+class JobRefModel(BaseModel):
+    """### One accepted per-source job."""
 
+    source: str
     run_id: str
     status: str
     status_url: str
+
+
+class JobAccepted(BaseModel):
+    """### Response for accepted crawl jobs (202): one job per requested source."""
+
+    jobs: list[JobRefModel]
 
 
 

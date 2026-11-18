@@ -35,3 +35,4 @@ skills-lock.json
 
 ######### Extracted records: local pipeline artifacts, not source
 data/
+coverage.xml

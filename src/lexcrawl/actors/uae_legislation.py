@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
@@ -11,7 +9,8 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
-from lexcrawl.actors.base import Actor, ActorRunResult
+from lexcrawl.actors.base import ActorRunResult, KnownFilter
+from lexcrawl.actors.detail import DetailAcquisitionActor
 from lexcrawl.config import required_setting
 from lexcrawl.crawling.base import redact_url
 from lexcrawl.crawling.firecrawl import FirecrawlError, FirecrawlScraper
@@ -239,10 +238,14 @@ def parse_detail(html: bytes | str, *, url: str, min_body_words: int) -> RawArti
     return article
 
 
-class UaeLegislationActor(Actor):
+class UaeLegislationActor(DetailAcquisitionActor[ArticleStub, RawArticle]):
     """### Collect UAE Legislation news by acquiring every page through Firecrawl."""
 
     name = SOURCE_NAME
+    noun = "article"
+    not_configured_message = "firecrawl is not configured; the UAE source cannot be acquired"
+    insufficient_error = InsufficientArticleContent
+    extraction_error = UaeExtractionError
 
     def __init__(
         self,
@@ -253,63 +256,33 @@ class UaeLegislationActor(Actor):
         max_detail_scrapes: int = 20,
         min_body_words: int = 30,
         source_name: str = SOURCE_NAME,
-        is_known: Callable[[str], bool] | None = None,
+        is_known: KnownFilter | None = None,
         max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing entry point, budgets, and the Firecrawl scraper."""
         self.listing_url = required_setting(listing_url, name="LISTINGS_URL")
         self.article_host, self.article_prefix = article_scope(self.listing_url)
-        self.firecrawl = firecrawl
-        self.max_pages = max(1, max_pages)
-        self.max_detail_scrapes = max(0, max_detail_scrapes)
-        self.min_body_words = max(1, min_body_words)
-        self.source_name = source_name
-        self._is_known = is_known
-        self._max_new_items = max_new_items
-        self._logger = get_logger(f"{__name__}.{source_name}")
-
-    def close(self) -> None:
-        """### Release the Firecrawl client when it owns resources."""
-        closer = getattr(self.firecrawl, "close", None)
-        if callable(closer):
-            closer()
-
-    def run(self, fetcher: object) -> ActorRunResult:
-        """### Page through the listing, then acquire each new article through Firecrawl."""
-        started_at = time.monotonic()
-        result = ActorRunResult(source=self.source_name)
-        if self.firecrawl is None:
-            result.add_error("firecrawl is not configured; the UAE source cannot be acquired")
-            return result
-
-        try:
-            stubs, complete = self._discover(result)
-            result.articles_discovered = len(stubs)
-            self._acquire(stubs, result)
-        except FirecrawlError as error:
-            # $ A provider-wide failure stops the run and is reported, never masked as empty.$
-            self._logger.exception("uae_firecrawl_failed", extra={"source": self.source_name})
-            result.add_error(f"firecrawl failed: {error}")
-            complete = False
-        except Exception as error:
-            self._logger.exception("uae_actor_failed", extra={"source": self.source_name})
-            result.add_error(f"unexpected actor failure: {error!r}")
-            complete = False
-
-        result.pagination_complete = complete
-        result.duration_seconds = time.monotonic() - started_at
-        self._logger.info(
-            "actor_run_finished",
-            extra={
-                "source": self.source_name,
-                "status": result.status,
-                "documents": len(result.documents),
-                "pending": result.documents_pending,
-                "credits": result.provider_credits_used,
-                "pagination_complete": result.pagination_complete,
-            },
+        self._init_acquisition(
+            firecrawl=firecrawl,
+            max_pages=max_pages,
+            max_detail_scrapes=max_detail_scrapes,
+            min_body_words=min_body_words,
+            source_name=source_name,
+            is_known=is_known,
+            max_new_items=max_new_items,
         )
-        return result
+
+    def _identity(self, stub: ArticleStub) -> str:
+        """### Return the stored identity for an article stub."""
+        return stable_identity(self.source_name, None, stub.url)
+
+    def _detail_url(self, stub: ArticleStub) -> str:
+        """### Return the detail URL for an article stub."""
+        return stub.url
+
+    def _parse(self, html: str, url: str) -> RawArticle:
+        """### Parse one article detail page."""
+        return parse_detail(html, url=url, min_body_words=self.min_body_words)
 
     def _discover(self, result: ActorRunResult) -> tuple[dict[str, ArticleStub], bool]:
         """### Follow the source's own next-page links until the end, a loop, or the bound."""
@@ -368,89 +341,23 @@ class UaeLegislationActor(Actor):
         result.listing_pages_succeeded += 1
         return page
 
-    def _acquire(self, stubs: dict[str, ArticleStub], result: ActorRunResult) -> None:
-        """### Scrape a detail page for each new article, within the detail budget."""
-        pending = [stub for stub in stubs.values() if not self._is_known_stub(stub)]
-        result.records_skipped_known += len(stubs) - len(pending)
-        if self._max_new_items is not None and len(pending) > self._max_new_items:
-            result.anomaly_detected = True
-            result.add_error(
-                f"anomaly: {len(pending)} new article(s) exceeds the {self._max_new_items} item limit; crawl skipped"
-            )
-            return
-        for index, stub in enumerate(pending):
-            if index >= self.max_detail_scrapes:
-                result.documents_pending = len(pending) - index
-                result.add_error(
-                    f"detail scrape budget reached; {result.documents_pending} article(s) pending for a later run"
-                )
-                return
-            result.detail_pages_attempted += 1
-            self._acquire_one(stub, result)
-
-    def _is_known_stub(self, stub: ArticleStub) -> bool:
-        """### Report whether an article identity was already ingested."""
-        return self._is_known is not None and self._is_known(stable_identity(self.source_name, None, stub.url))
-
-    def _acquire_one(self, stub: ArticleStub, result: ActorRunResult) -> None:
-        """### Acquire and validate one article, isolating its failures."""
-        assert self.firecrawl is not None
-        try:
-            scraped = self.firecrawl.scrape(stub.url, cache=True)
-        except FirecrawlError as error:
-            self._fail(stub, result, f"firecrawl detail failed: {error}")
-            return
-        result.provider_credits_used += scraped.credits_used
-        if scraped.target_status is not None and scraped.target_status >= 400:
-            self._fail(stub, result, f"detail page returned HTTP {scraped.target_status}")
-            return
-        try:
-            article = parse_detail(scraped.html, url=stub.url, min_body_words=self.min_body_words)
-        except InsufficientArticleContent as error:
-            # $ The page parsed, so its metadata is still worth keeping.$
-            self._store(error.article, stub, result, error=str(error))
-            return
-        except UaeExtractionError as error:
-            self._fail(stub, result, f"detail extraction failed: {error}")
-            return
-        self._store(article, stub, result)
-
-    def _store(
-        self,
-        article: RawArticle,
-        stub: ArticleStub,
-        result: ActorRunResult,
-        *,
-        error: str | None = None,
-    ) -> None:
+    def _store_document(self, article: RawArticle, stub: ArticleStub, result: ActorRunResult) -> None:
         """### Canonicalize one article, filling gaps from its listing card."""
-        article = article.model_copy(
-            update={
-                "summary": article.summary or stub.summary,
-                "image_url": article.image_url or stub.image_url,
-                "published_at": article.published_at or stub.published_at,
-            }
-        )
-        document = CanonicalDocument.from_raw(article)
-        if error is not None:
-            result.detail_pages_failed += 1
-            result.records_without_text += 1
-            result.records_missing_required_fields += 1
-            result.add_error(f"{redact_url(stub.url)}: {error}")
-            # $ An incomplete body is dropped so a failed record never carries partial text.$
-            document = document.model_copy(
-                update={"text": None, "content_hash": None, "extraction_status": "failed", "extraction_error": error}
-            )
-        else:
-            result.detail_pages_succeeded += 1
+        document = CanonicalDocument.from_raw(self._fill_from_stub(article, stub))
+        result.detail_pages_succeeded += 1
         result.documents.append(document)
 
-    def _fail(self, stub: ArticleStub, result: ActorRunResult, message: str) -> None:
+    def _store_partial(self, article: RawArticle, stub: ArticleStub, result: ActorRunResult, error: str) -> None:
+        """### Record a parsed-but-incomplete article, dropping any partial text."""
+        self._note_failure(stub.url, error, result)
+        document = CanonicalDocument.from_raw(self._fill_from_stub(article, stub)).model_copy(
+            update={"text": None, "content_hash": None, "extraction_status": "failed", "extraction_error": error}
+        )
+        result.documents.append(document)
+
+    def _fail_item(self, stub: ArticleStub, result: ActorRunResult, message: str) -> None:
         """### Record an unusable article while preserving its discovered metadata."""
-        result.detail_pages_failed += 1
-        result.records_missing_required_fields += 1
-        result.records_without_text += 1
-        result.add_error(f"{redact_url(stub.url)}: {message}")
+        self._note_failure(stub.url, message, result)
         document = CanonicalDocument.from_listing_entry(
             stub,
             source=self.source_name,
@@ -459,3 +366,14 @@ class UaeLegislationActor(Actor):
             extraction_error=message,
         )
         result.documents.append(document)
+
+    @staticmethod
+    def _fill_from_stub(article: RawArticle, stub: ArticleStub) -> RawArticle:
+        """### Fill a page's missing fields from its listing card."""
+        return article.model_copy(
+            update={
+                "summary": article.summary or stub.summary,
+                "image_url": article.image_url or stub.image_url,
+                "published_at": article.published_at or stub.published_at,
+            }
+        )

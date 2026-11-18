@@ -78,17 +78,23 @@ class FirecrawlClient:
         self.close()
 
     def scrape(self, url: str, *, cache: bool = False) -> ScrapedPage:
-        """### Scrape a URL, optionally reusing a cached successful response."""
+        """### Scrape a URL, reusing a cached page when requested (read-through)."""
         cached = self._read_cache(url) if cache else None
         if cached is not None:
             LOGGER.info("firecrawl_cache_hit", extra={"url": url})
             return cached
-        page = self._scrape_with_retries(url)
-        # $ Never cache error/challenge/thin pages, or a retry would replay the failure forever.$
-        cacheable = (page.target_status is None or page.target_status < 400) and bool(page.html.strip())
-        if cache and cacheable:
+        return self._scrape_with_retries(url)
+
+    def store(self, url: str, page: ScrapedPage) -> None:
+        """### Cache a page only after the actor validated and parsed it."""
+        if (page.target_status is None or page.target_status < 400) and page.html.strip():
             self._write_cache(url, page)
-        return page
+
+    def evict(self, url: str) -> None:
+        """### Delete a cached page (used when a cached copy fails to parse)."""
+        path = self._cache_path(url)
+        if path is not None and path.is_file():
+            path.unlink(missing_ok=True)
 
     def _scrape_with_retries(self, url: str) -> ScrapedPage:
         """### Issue the request with bounded exponential backoff for transient failures."""
@@ -241,25 +247,36 @@ class FirecrawlClient:
         )
 
     def _write_cache(self, url: str, page: ScrapedPage) -> None:
-        """### Persist a successful scrape so reruns do not spend credits again."""
+        """### Persist a successful scrape so reruns do not spend credits again.
+
+        A cache write failure (for example a read-only volume) is logged but never
+        raised: the caller has already spent the credits and has a usable page.
+        """
         path = self._cache_path(url)
         if path is None:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "url": url,
-                    "provider_status": page.provider_status,
-                    "target_status": page.target_status,
-                    "html": page.html,
-                    "markdown": page.markdown,
-                    "fetched_at": time.time(),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "url": url,
+                        "provider_status": page.provider_status,
+                        "target_status": page.target_status,
+                        "html": page.html,
+                        "markdown": page.markdown,
+                        "fetched_at": time.time(),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            # $ A failed cache write must not fail the crawl that already paid for the page.$
+            LOGGER.warning(
+                "firecrawl_cache_write_failed",
+                extra={"url": url, "error": str(error), "path": str(path)},
+            )
 
 
 def _parse_retry_after(value: str | None) -> float | None:

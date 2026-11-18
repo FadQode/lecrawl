@@ -19,8 +19,10 @@ services:
     build: .
     command: ["alembic", "upgrade", "head"]
     environment: &app_env
-      DATABASE_URL: postgresql+psycopg://lexcrawl:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/lexcrawl
-      STATE_BACKEND: db
+      DB_HOST: db
+      DB_USER: lexcrawl
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DB_NAME: lexcrawl
       API_TOKEN: ${API_TOKEN:?set API_TOKEN}
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       CRAWL_USER_AGENT: ${CRAWL_USER_AGENT:-LexCrawl/0.1}
@@ -39,6 +41,18 @@ services:
     environment: *app_env
     ports:
       - "8000:8000"
+    volumes:
+      - crawlstate:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    build: .
+    command: ["lexcrawl", "schedule"]
+    environment: *app_env
+    volumes:
+      - crawlstate:/app/data
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -47,9 +61,23 @@ services:
     build: .
     command: ["lexcrawl", "worker"]
     environment: *app_env
+    volumes:
+      - crawlstate:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  resource-worker:
+    build: .
+    command: ["lexcrawl", "worker", "--queue", "resources"]
+    environment: *app_env
+    volumes:
+      - crawlstate:/app/data
     depends_on:
       migrate:
         condition: service_completed_successfully
 
 volumes:
   pgdata:
+  # $ Persists the Firecrawl response cache (data/) across container recreation.$
+  crawlstate:

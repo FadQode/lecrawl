@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 
 from apscheduler.job import Job
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from lexcrawl.checks.runner import DailySourceResult, run_daily
 from lexcrawl.config import Settings
 from lexcrawl.factory import CHECK_SOURCES
-from lexcrawl.locking import FileLock
+from lexcrawl.locking import RunInProgressError
 from lexcrawl.logging import get_logger
 
 LOGGER = get_logger(__name__)
@@ -21,19 +20,16 @@ DAILY_JOB_ID = "daily-run"
 
 
 def run_scheduled_job(settings: Settings) -> list[DailySourceResult]:
-    """### Run the daily flow under the run lock, skipping if another run holds it."""
-    lock = FileLock(Path(settings.run_lock_path))
-    if not lock.acquire():
-        LOGGER.warning("scheduled_run_skipped_locked")
-        return []
+    """### Run the daily flow, skipping when another run holds the advisory lock."""
     try:
         results = run_daily(settings, sources=CHECK_SOURCES, trigger="scheduled")
+    except RunInProgressError:
+        LOGGER.warning("scheduled_run_skipped_locked")
+        return []
     except Exception:
         # $ A scheduled failure is logged, never raised into the scheduler thread.$
         LOGGER.exception("scheduled_daily_failed")
         return []
-    finally:
-        lock.release()
     for result in results:
         LOGGER.info(
             "scheduled_daily_source",

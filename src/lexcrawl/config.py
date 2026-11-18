@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import URL
 
 
 class Settings(BaseSettings):
@@ -19,11 +20,12 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    # --- Runtime ------------------------------------------------------------
     environment: str = "local"
     log_level: str = "INFO"
     log_format: Literal["json", "console"] = "json"
 
-    # $ Crawl policy shared by every source actor.$
+    # --- Crawl policy (shared by every source actor) ------------------------
     crawl_user_agent: str = "LexCrawl/0.1 (+https://github.com/OWNER/lexcrawl)"
     crawl_request_timeout_seconds: float = Field(default=30.0, gt=0)
     crawl_max_retries: int = Field(default=3, ge=0, le=10)
@@ -31,14 +33,16 @@ class Settings(BaseSettings):
     crawl_request_delay_seconds: float = Field(default=1.0, ge=0)
     crawl_max_listing_pages: int = Field(default=25, ge=1)
     crawl_max_response_bytes: int = Field(default=26_214_400, gt=0)
+    crawl_cache_max_entries: int = Field(default=256, ge=0)
 
-    # $ Source locations come from the environment, so the repository names no live site.$
+    # --- UAE Legislation (news) --------------------------------------------
     listings_url: str = ""
     listings_language: str = "ar"
     uae_max_detail_scrapes_per_run: int = Field(default=20, ge=0, le=500)
     # $ UAE is fetched directly when it answers without a challenge, with Firecrawl as the fallback.$
     uae_direct_fetch: bool = True
 
+    # --- Canadian Bar Association (news releases) ---------------------------
     releases_api_url: str = ""
     releases_site_url: str = ""
     releases_article_path: str = "/article/"
@@ -47,7 +51,7 @@ class Settings(BaseSettings):
     releases_page_size: int = Field(default=50, ge=1, le=200)
     releases_max_pages: int = Field(default=10, ge=1)
 
-    # $ Commerce reports are acquired through Firecrawl, which is budget-limited.$
+    # --- U.S. Department of Commerce (reports, via Firecrawl) ---------------
     reports_listing_url: str = ""
     firecrawl_api_key: str = ""
     firecrawl_api_url: str = "https://api.firecrawl.dev/v2/scrape"
@@ -59,54 +63,68 @@ class Settings(BaseSettings):
     firecrawl_min_body_words: int = Field(default=30, ge=1)
     firecrawl_cache_dir: str = "data/firecrawl-cache"
 
-    # $ Extracted records are written here as timestamped JSON.$
+    # --- Output -------------------------------------------------------------
     output_dir: str = "data"
 
-    # $ Change-detection watermarks are persisted here until the database exists.$
-    check_state_path: str = "data/state/checks.json"
-
-    # $ Ingested document identities are persisted here until the database exists.$
-    identities_state_path: str = "data/state/identities.json"
-
-    # $ Monthly Firecrawl credit usage is tracked here until the database exists.$
-    usage_state_path: str = "data/state/usage.json"
-
-    # $ Persistence: the database is the application default; JSON stores are for tests/dev.$
+    # --- PostgreSQL (the only persistence backend) --------------------------
     database_url: str = ""
+    db_host: str = ""
+    db_user: str = "lexcrawl"
+    db_password: str = ""
+    db_name: str = "lexcrawl"
     db_echo: bool = False
     db_pool_size: int = Field(default=5, ge=1)
     db_max_overflow: int = Field(default=5, ge=0)
     db_pool_timeout: float = Field(default=30.0, gt=0)
     db_connect_timeout: int = Field(default=10, ge=1)
-    state_backend: Literal["db", "json"] = "db"
 
-    # $ Daily scheduler (APScheduler), started by `lexcrawl schedule`.$
+    # --- Daily scheduler (APScheduler), started by `lexcrawl schedule` ------
     schedule_enabled: bool = True
     schedule_daily_cron: str = "0 6 * * *"
     schedule_timezone: str = "UTC"
-    schedule_lock_path: str = "data/state/scheduler.lock"
-    run_lock_path: str = "data/state/run.lock"
 
-    # $ Guards: pause on an unexpected burst, and cap monthly provider spend.$
+    # --- Guards: pause on an unexpected burst, cap monthly provider spend ---
     anomaly_max_new_items: int = Field(default=10, ge=0)
     firecrawl_monthly_credit_cap: int = Field(default=900, ge=0)
 
-    # $ HTTP API and worker.$ 
+    # --- HTTP API and worker ------------------------------------------------
     api_token: str = ""
     api_title: str = "LexCrawl API"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     job_claim_lease_seconds: int = Field(default=900, ge=1)
 
-    # $ Attachment (PDF) extraction retry cap and per-attachment size limit.$
+    # --- Attachment (PDF) extraction ---------------------------------------
     resource_extraction_attempts: int = Field(default=3, ge=1, le=20)
     resource_max_bytes: int = Field(default=20_000_000, gt=0)
-    # $ How long a worker's claim on an attachment stays valid before it can be reclaimed.$
     resource_claim_lease_seconds: int = Field(default=300, ge=1)
+    resource_allowed_host_suffixes: list[str] = Field(default_factory=lambda: [".gov", "cba.ca"])
 
-    # $ Retry pending documents independently of change detection, and reconcile periodically.$
+    # --- Change detection ---------------------------------------------------
     document_extraction_attempts: int = Field(default=3, ge=1, le=20)
     reconcile_interval_days: int = Field(default=7, ge=0)
+
+    def database_dsn(self) -> str:
+        """### Return the configured DSN, or build one from parts (safe for special chars)."""
+        if self.database_url.strip():
+            return self.database_url
+        if self.db_host.strip():
+            return URL.create(
+                "postgresql+psycopg",
+                username=self.db_user,
+                password=self.db_password,
+                host=self.db_host,
+                port=5432,
+                database=self.db_name,
+            ).render_as_string(hide_password=False)
+        return ""
+
+    def require_database_url(self) -> str:
+        """### Return the DSN, failing fast when no database is configured."""
+        dsn = self.database_dsn()
+        if not dsn.strip():
+            raise ValueError("DATABASE_URL (or DB_HOST/DB_USER/DB_PASSWORD/DB_NAME) is not configured")
+        return dsn
 
 
 def required_setting(value: str, *, name: str) -> str:

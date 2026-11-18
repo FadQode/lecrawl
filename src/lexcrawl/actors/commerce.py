@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import re
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import unquote, urljoin, urlparse
@@ -12,9 +10,9 @@ from urllib.parse import unquote, urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
-from lexcrawl.actors.base import Actor, ActorRunResult
+from lexcrawl.actors.base import ActorRunResult, KnownFilter
+from lexcrawl.actors.detail import DetailAcquisitionActor
 from lexcrawl.config import required_setting
-from lexcrawl.crawling.base import redact_url
 from lexcrawl.crawling.firecrawl import FirecrawlError, FirecrawlScraper
 from lexcrawl.logging import get_logger
 from lexcrawl.models.document import (
@@ -318,10 +316,14 @@ def _detail_attachments(article: Tag, url: str) -> tuple[DocumentResource, ...]:
     return tuple(resources)
 
 
-class CommerceReportsActor(Actor):
+class CommerceReportsActor(DetailAcquisitionActor[ListingEntry, RawArticle]):
     """### Collect Commerce reports by acquiring each page through Firecrawl."""
 
     name = SOURCE_NAME
+    noun = "report"
+    not_configured_message = "firecrawl is not configured; the Commerce source cannot be acquired"
+    insufficient_error = InsufficientReportContent
+    extraction_error = CommerceExtractionError
 
     def __init__(
         self,
@@ -332,7 +334,7 @@ class CommerceReportsActor(Actor):
         max_detail_scrapes: int = 20,
         min_body_words: int = 30,
         source_name: str = SOURCE_NAME,
-        is_known: Callable[[str], bool] | None = None,
+        is_known: KnownFilter | None = None,
         max_new_items: int | None = None,
     ) -> None:
         """### Configure the listing entry point, budgets, and the Firecrawl scraper."""
@@ -340,57 +342,27 @@ class CommerceReportsActor(Actor):
         parsed = urlparse(self.listing_url)
         self.article_host = parsed.netloc.lower()
         self.article_paths = (f"{parsed.path.rstrip('/')}/",)
-        self.firecrawl = firecrawl
-        self.max_pages = max(1, max_pages)
-        self.max_detail_scrapes = max(0, max_detail_scrapes)
-        self.min_body_words = max(1, min_body_words)
-        self.source_name = source_name
-        self._is_known = is_known
-        self._max_new_items = max_new_items
-        self._logger = get_logger(f"{__name__}.{source_name}")
-
-    def close(self) -> None:
-        """### Release the Firecrawl client when it owns resources."""
-        closer = getattr(self.firecrawl, "close", None)
-        if callable(closer):
-            closer()
-
-    def run(self, fetcher: object) -> ActorRunResult:
-        """### Discover report listings through Firecrawl, then acquire each new report."""
-        started_at = time.monotonic()
-        result = ActorRunResult(source=self.source_name)
-        if self.firecrawl is None:
-            result.add_error("firecrawl is not configured; the Commerce source cannot be acquired")
-            return result
-
-        try:
-            collected, complete = self._discover(result)
-            result.articles_discovered = len(collected)
-            self._acquire(collected, result)
-        except FirecrawlError as error:
-            # $ A provider-wide failure stops the run and is reported, never masked as empty.$
-            self._logger.exception("commerce_firecrawl_failed", extra={"source": self.source_name})
-            result.add_error(f"firecrawl failed: {error}")
-            complete = False
-        except Exception as error:
-            self._logger.exception("commerce_actor_failed", extra={"source": self.source_name})
-            result.add_error(f"unexpected actor failure: {error!r}")
-            complete = False
-
-        result.pagination_complete = complete
-        result.duration_seconds = time.monotonic() - started_at
-        self._logger.info(
-            "actor_run_finished",
-            extra={
-                "source": self.source_name,
-                "status": result.status,
-                "documents": len(result.documents),
-                "pending": result.documents_pending,
-                "credits": result.provider_credits_used,
-                "pagination_complete": result.pagination_complete,
-            },
+        self._init_acquisition(
+            firecrawl=firecrawl,
+            max_pages=max_pages,
+            max_detail_scrapes=max_detail_scrapes,
+            min_body_words=min_body_words,
+            source_name=source_name,
+            is_known=is_known,
+            max_new_items=max_new_items,
         )
-        return result
+
+    def _identity(self, entry: ListingEntry) -> str:
+        """### Return the stored identity for a listing entry."""
+        return entry.identity
+
+    def _detail_url(self, entry: ListingEntry) -> str:
+        """### Return the detail URL for a listing entry."""
+        return entry.url
+
+    def _parse(self, html: str, url: str) -> RawArticle:
+        """### Parse one report detail page."""
+        return parse_detail(html, url=url, min_body_words=self.min_body_words)
 
     def _discover(self, result: ActorRunResult) -> tuple[dict[str, ListingEntry], bool]:
         """### Page through the listing through Firecrawl until the overlap boundary or the end."""
@@ -464,84 +436,28 @@ class CommerceReportsActor(Actor):
         result.listing_pages_succeeded += 1
         return page
 
-    def _acquire(self, entries: dict[str, ListingEntry], result: ActorRunResult) -> None:
-        """### Scrape a detail page for each new report, within the detail budget."""
-        pending = [entry for entry in entries.values() if not self._is_known_entry(entry)]
-        result.records_skipped_known += len(entries) - len(pending)
-        if self._max_new_items is not None and len(pending) > self._max_new_items:
-            result.anomaly_detected = True
-            result.add_error(
-                f"anomaly: {len(pending)} new report(s) exceeds the {self._max_new_items} item limit; crawl skipped"
-            )
-            return
-        for index, entry in enumerate(pending):
-            if index >= self.max_detail_scrapes:
-                result.documents_pending = len(pending) - index
-                result.add_error(
-                    f"detail scrape budget reached; {result.documents_pending} report(s) pending for a later run"
-                )
-                return
-            result.detail_pages_attempted += 1
-            self._acquire_one(entry, result)
-
-    def _is_known_entry(self, entry: ListingEntry) -> bool:
-        """### Report whether a report identity was already ingested."""
-        return self._is_known is not None and self._is_known(entry.identity)
-
-    def _acquire_one(self, entry: ListingEntry, result: ActorRunResult) -> None:
-        """### Acquire and validate one report, isolating its failures."""
-        assert self.firecrawl is not None
-        try:
-            scraped = self.firecrawl.scrape(entry.url, cache=True)
-        except FirecrawlError as error:
-            self._fail_report(entry, result, f"firecrawl detail failed: {error}")
-            return
-        result.provider_credits_used += scraped.credits_used
-        if scraped.target_status is not None and scraped.target_status >= 400:
-            self._fail_report(entry, result, f"detail page returned HTTP {scraped.target_status}")
-            return
-        try:
-            article = parse_detail(scraped.html, url=entry.url, min_body_words=self.min_body_words)
-        except InsufficientReportContent as error:
-            # $ The page parsed, so its metadata and attachments are still worth keeping.$
-            self._store_article(error.article, entry, result, error=str(error))
-            return
-        except CommerceExtractionError as error:
-            self._fail_report(entry, result, f"detail extraction failed: {error}")
-            return
-        self._store_article(article, entry, result)
-
-    def _store_article(
-        self,
-        article: RawArticle,
-        entry: ListingEntry,
-        result: ActorRunResult,
-        *,
-        error: str | None = None,
-    ) -> None:
+    def _store_document(self, article: RawArticle, entry: ListingEntry, result: ActorRunResult) -> None:
         """### Canonicalize one report, keeping its discovery metadata and resources."""
         self._apply_listing_fallbacks(article, entry)
         article = article.model_copy(update={"resources": self._merge_resources(article.resources, entry.resources)})
-        document = CanonicalDocument.from_raw(article)
-        if error is not None:
-            result.detail_pages_failed += 1
-            result.records_without_text += 1
-            result.records_missing_required_fields += 1
-            result.add_error(f"{redact_url(entry.url)}: {error}")
-            # $ An incomplete body is dropped so a failed record never carries partial text.$
-            document = document.model_copy(
-                update={"text": None, "content_hash": None, "extraction_status": "failed", "extraction_error": error}
-            )
-        else:
-            result.detail_pages_succeeded += 1
+        result.detail_pages_succeeded += 1
+        result.documents.append(CanonicalDocument.from_raw(article))
+
+    def _store_partial(
+        self, article: RawArticle, entry: ListingEntry, result: ActorRunResult, error: str
+    ) -> None:
+        """### Record a parsed-but-incomplete report, dropping any partial text."""
+        self._apply_listing_fallbacks(article, entry)
+        article = article.model_copy(update={"resources": self._merge_resources(article.resources, entry.resources)})
+        self._note_failure(entry.url, error, result)
+        document = CanonicalDocument.from_raw(article).model_copy(
+            update={"text": None, "content_hash": None, "extraction_status": "failed", "extraction_error": error}
+        )
         result.documents.append(document)
 
-    def _fail_report(self, entry: ListingEntry, result: ActorRunResult, message: str) -> None:
+    def _fail_item(self, entry: ListingEntry, result: ActorRunResult, message: str) -> None:
         """### Record an unusable report while preserving its discovered metadata."""
-        result.detail_pages_failed += 1
-        result.records_missing_required_fields += 1
-        result.records_without_text += 1
-        result.add_error(f"{redact_url(entry.url)}: {message}")
+        self._note_failure(entry.url, message, result)
         document = CanonicalDocument.from_listing_entry(
             ArticleStub(url=entry.url, title=entry.title),
             source=self.source_name,

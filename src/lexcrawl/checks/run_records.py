@@ -89,49 +89,6 @@ class RunRecorder(Protocol):
         ...
 
 
-class NoOpRunRecorder:
-    """### A recorder that persists nothing (JSON mode and tests)."""
-
-    def start(self, trigger_type: str, run_id: str | None = None) -> RunHandle | None:
-        """### Return None; nothing is recorded."""
-        return None
-
-    def record_source(
-        self,
-        run_id: int,
-        source: str,
-        *,
-        outcome: CheckOutcome,
-        status: str,
-        discovered: int,
-        inserted: int,
-        updated: int,
-        skipped: int,
-        failed: int,
-        resources: int,
-        pending: int,
-        credits: int,
-        pagination_complete: bool,
-        detail: str,
-        started_at: datetime,
-        finished_at: datetime,
-    ) -> int | None:
-        """### Do nothing."""
-        return None
-
-    def record_errors(self, crawl_run_source_id: int, errors: Sequence[str]) -> None:
-        """### Do nothing."""
-        return None
-
-    def finish(self, run_id: int, *, status: str, credits: int, duration_ms: int) -> None:
-        """### Do nothing."""
-        return None
-
-    def close(self) -> None:
-        """### Do nothing."""
-        return None
-
-
 class DbRunRecorder:
     """### Persist crawl runs, per-source metrics, and sanitized errors to PostgreSQL."""
 

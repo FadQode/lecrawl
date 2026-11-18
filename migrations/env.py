@@ -13,6 +13,7 @@ from sqlalchemy import engine_from_config, pool
 from lexcrawl.config import get_settings
 from lexcrawl.db import models  # noqa: F401  # $ Registers the models on the metadata.$
 from lexcrawl.db.base import Base
+from lexcrawl.db.engine import resolve_database_url
 
 config = context.config
 
@@ -24,10 +25,10 @@ target_metadata = Base.metadata
 
 def _database_url() -> str:
     """### Return the configured database URL, failing fast when missing."""
-    settings = get_settings()
-    if not settings.database_url.strip():
-        raise RuntimeError("DATABASE_URL is not configured; set it in .env (see .env.example)")
-    return settings.database_url
+    dsn = resolve_database_url(get_settings())
+    if not dsn.strip():
+        raise RuntimeError("DATABASE_URL (or DB_HOST/DB_USER/DB_PASSWORD) is not configured")
+    return dsn
 
 
 def run_migrations_offline() -> None:

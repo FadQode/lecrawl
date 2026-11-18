@@ -30,3 +30,9 @@ class HttpResourceFetcher:
         """### Fetch the payload, bounding memory via the underlying streaming fetch."""
         # $ fetch_binary streams in chunks and raises ResponseTooLargeError past the cap.$
         return self._fetcher.fetch_binary(url, max_bytes=max_bytes).content
+
+    def close(self) -> None:
+        """### Close the underlying HTTP client."""
+        closer = getattr(self._fetcher, "close", None)
+        if callable(closer):
+            closer()

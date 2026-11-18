@@ -15,6 +15,7 @@ from lexcrawl.checks.runner import DailySourceResult, run_daily
 from lexcrawl.config import Settings, get_settings
 from lexcrawl.crawling.base import Fetcher
 from lexcrawl.crawling.http import HttpFetcher
+from lexcrawl.db.engine import create_db_engine
 from lexcrawl.factory import (
     CHECK_SOURCES,
     SOURCE_NAMES,
@@ -25,7 +26,7 @@ from lexcrawl.factory import (
     build_scraper,
     redirect_host_allowlist,
 )
-from lexcrawl.locking import FileLock, RunInProgressError
+from lexcrawl.locking import SCHEDULER_ADVISORY_LOCK_KEY, AdvisoryLock, RunInProgressError
 from lexcrawl.logging import configure_logging, get_logger
 from lexcrawl.orchestrator import CrawlRunReport, run_crawl
 from lexcrawl.scheduler import CrawlScheduler
@@ -89,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = subcommands.add_parser("worker", help="claim and run queued crawl jobs")
     worker.add_argument("--once", action="store_true", help="process at most one queued job then exit")
+    worker.add_argument(
+        "--queue",
+        choices=["crawl", "resources"],
+        default="crawl",
+        help="which queue to drain: crawl jobs (default) or PDF attachments",
+    )
     _add_logging_options(worker)
     return parser
 
@@ -201,10 +208,6 @@ def run_checks(arguments: argparse.Namespace, settings: Settings) -> int:
 def run_daily_command(arguments: argparse.Namespace, settings: Settings) -> int:
     """### Run the daily probe-then-crawl flow and return a gate exit code."""
     names = tuple(CHECK_SOURCES) if arguments.source == "all" else (arguments.source,)
-    lock = FileLock(Path(settings.run_lock_path))
-    if not lock.acquire():
-        print("a daily run is already in progress; skipping")
-        return 2
     try:
         results = run_daily(
             settings,
@@ -220,8 +223,6 @@ def run_daily_command(arguments: argparse.Namespace, settings: Settings) -> int:
     except ValueError as error:
         print(f"configuration error: {error}")
         return 2
-    finally:
-        lock.release()
 
     print(f"daily status: {len(results)} source(s)")
     exit_code = 0
@@ -243,8 +244,10 @@ def run_serve_command(arguments: argparse.Namespace, settings: Settings) -> int:
 
 
 def run_worker_command(arguments: argparse.Namespace, settings: Settings) -> int:
-    """### Claim and run queued crawl jobs (once, or until interrupted)."""
-    from lexcrawl.worker import run_once
+    """### Claim and run queued jobs (once, or until interrupted) from the chosen queue."""
+    if getattr(arguments, "queue", "crawl") == "resources":
+        return _run_resource_worker(arguments, settings)
+    from lexcrawl.worker import run_forever, run_once
 
     try:
         if arguments.once:
@@ -260,9 +263,35 @@ def run_worker_command(arguments: argparse.Namespace, settings: Settings) -> int
         previous_int = signal.signal(signal.SIGINT, _handle)
         previous_term = signal.signal(signal.SIGTERM, _handle)
         try:
-            while not stop.is_set():
-                if not run_once(settings):
-                    stop.wait(5.0)
+            run_forever(settings, stop=stop)
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+        return 0
+    except ValueError as error:
+        print(f"configuration error: {error}")
+        return 2
+
+
+def _run_resource_worker(arguments: argparse.Namespace, settings: Settings) -> int:
+    """### Claim and extract due attachments (once, or until interrupted)."""
+    from lexcrawl.resource_worker import process_resources_once, run_resources_forever
+
+    try:
+        if arguments.once:
+            handled = process_resources_once(settings)
+            print(f"processed {handled} attachment(s)")
+            return 0
+        stop = threading.Event()
+
+        def _handle(signum: int, frame: object) -> None:
+            """### Signal the resource worker loop to stop."""
+            stop.set()
+
+        previous_int = signal.signal(signal.SIGINT, _handle)
+        previous_term = signal.signal(signal.SIGTERM, _handle)
+        try:
+            run_resources_forever(settings, stop=stop)
         finally:
             signal.signal(signal.SIGINT, previous_int)
             signal.signal(signal.SIGTERM, previous_term)
@@ -274,8 +303,10 @@ def run_worker_command(arguments: argparse.Namespace, settings: Settings) -> int
 
 def run_schedule_command(settings: Settings) -> int:
     """### Run the daily job on a cron until interrupted."""
-    lock = FileLock(Path(settings.schedule_lock_path))
+    engine = create_db_engine(settings)
+    lock = AdvisoryLock(engine, key=SCHEDULER_ADVISORY_LOCK_KEY)
     if not lock.acquire():
+        engine.dispose()
         print("another scheduler is already running")
         return 2
 
@@ -305,6 +336,7 @@ def run_schedule_command(settings: Settings) -> int:
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)
         lock.release()
+        engine.dispose()
     return 0
 
 

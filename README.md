@@ -24,24 +24,27 @@ API, and scheduling are planned next.
 | Advisory-lock run coordination + durable job queue + worker | Implemented |
 | API response contracts (models only; routes not started) | Implemented |
 | Per-source failure isolation (one source can't abort the others) | Implemented |
-| Daily scheduler (`lexcrawl schedule`, APScheduler) + run lock | Implemented |
+| Daily scheduler (`lexcrawl schedule`, APScheduler) + per-source locks | Implemented |
 | Anomaly guard + monthly credit budget governor | Implemented |
 | PostgreSQL persistence (`sources`, `documents`, `document_resources`) | Implemented |
 | Content processing service + PDF extraction pipeline (opt-in) | Implemented |
 | PDF attachment extraction wired live per source | Not started (dormant until a byte fetcher is provided) |
 | FastAPI API (reads + job submission; Swagger at /docs) | Implemented |
-| Docker Compose (db + api + worker) | Implemented |
-| GitHub Actions daily crawl (00:00 UTC) | Implemented |
+| Docker Compose (db + api + scheduler + worker + resource-worker) | Implemented |
+| GitHub Actions crawl (manual `workflow_dispatch`; cron owned by the scheduler) | Implemented |
 
 ## Layout
 
 ```text
 src/lexcrawl/
 ├── actors/
-│   ├── base.py        # Actor contract + ActorRunResult counters
+│   ├── base.py        # Actor contract + ActorRunResult counters + partition_known
+│   ├── detail.py      # DetailAcquisitionActor: shared listing→detail loop (UAE, Commerce)
 │   ├── cba.py         # CBA listing feed + article page parsing and Actor
 │   ├── commerce.py    # Commerce reports listing + detail parsing over Firecrawl
 │   └── uae_legislation.py  # UAE news listing + article parsing over Firecrawl
+├── sources/
+│   └── registry.py    # SourceSpec registry: one entry per source (scraper/check/actor)
 ├── crawling/
 │   ├── base.py        # Fetcher protocol, FetchedPage, fetch errors, block detection
 │   ├── http.py        # httpx strategy: timeouts, bounded retries, pacing, redirect checks
@@ -55,15 +58,15 @@ src/lexcrawl/
 ├── orchestrator.py    # runs actors in isolation, aggregates the run report
 ├── checks/            # cheap per-source change probes that gate the actors
 │   ├── base.py        # Check contract, CheckProbe, evaluate() verdict
-│   ├── store.py       # JSON watermark store (moved to the database later)
-│   ├── identities.py  # JSON identity store: what has already been ingested
-│   ├── usage.py       # JSON monthly provider-credit usage (budget governor)
+│   ├── checkpoints.py # DB checkpoint (watermark) store
+│   ├── identities.py  # DB identity memory: what has already been ingested
+│   ├── budget.py      # DB monthly provider-credit budget (budget governor)
 │   ├── runner.py      # run_daily: probe, guard, then crawl only what changed
 │   ├── uae.py         # fingerprint the listing's article set (free)
 │   ├── cba.py         # fingerprint the sitemap's article count + newest lastmod (free)
 │   └── commerce.py    # fingerprint the listing's newest report + total count (Firecrawl)
 ├── scheduler.py       # APScheduler daily job around run_daily (`lexcrawl schedule`)
-├── locking.py         # advisory file lock (scheduled vs manual runs)
+├── locking.py         # PostgreSQL advisory locks (per source, plus the scheduler lock)
 ├── alerts.py          # structured alert hook (anomaly / budget / check_failed)
 ├── factory.py         # composition root: builds checks, actors, scrapers, memory
 ├── cli.py             # `lexcrawl crawl` / `check` / `daily` / `schedule`
@@ -115,10 +118,15 @@ uv run lexcrawl schedule
 ## Testing
 
 ```bash
-uv run pytest
+uv run alembic upgrade head       # @db tests need a migrated database
+uv run pytest --cov=lexcrawl --cov-fail-under=70
 uv run ruff check .
 uv run mypy
 ```
+
+CI (`.github/workflows/ci.yml`) runs ruff/mypy/pytest with coverage on every push and pull
+request against a throwaway Postgres; `.github/workflows/crawl.yml` is an on-demand crawl (the daily
+cron is owned by the in-app scheduler, so a shared database is never crawled twice a day).
 
 ## Daily run
 
@@ -131,13 +139,12 @@ uv run mypy
 
 When a source changed, the actor is handed the set of **already-ingested identities** and fetches
 only new items. The watermark advances only after a fully successful run (nothing pending), so a
-failed fetch is retried next run. State lives in `data/state/checks.json` (watermarks) and
-`data/state/identities.json` (identities) until the PostgreSQL layer lands.
+failed fetch is retried next run. State lives in PostgreSQL (see below).
 
 ## Persistence
 
-State lives in PostgreSQL by default (`STATE_BACKEND=db`); the JSON stores remain available for
-tests and explicit local development (`STATE_BACKEND=json`). Apply the schema with:
+State lives in PostgreSQL: checkpoints (watermarks), document identities, credit usage, and the
+crawl-run log are all tables. Apply the schema with:
 
 ```bash
 uv run alembic upgrade head
@@ -145,8 +152,8 @@ uv run alembic upgrade head
 
 Phase 1 stores `sources` (a seeded registry) and `documents` — the canonical projection, one row
 per source + identity, written with monotonic upserts (a failed re-fetch never replaces good
-content). "What have we already ingested?" is now a query over `documents`; watermarks and monthly
-usage still use the JSON stores until their tables land.
+content). "What have we already ingested?" is a query over `documents`; watermarks (checkpoints) and
+monthly usage have their own tables.
 
 Phase 2 adds `document_resources` and a `ContentProcessingService` that persists a document with
 its attachments and drives **per-attachment** extraction: each PDF is processed independently, with
@@ -201,9 +208,9 @@ orchestrator is `checks/runner.run_daily`; fingerprints live in `checks/fingerpr
 ## Scheduler and guards
 
 `lexcrawl schedule` runs `run_daily` on a daily cron (default `0 6 * * *` UTC, configurable via
-`SCHEDULE_DAILY_CRON`, `SCHEDULE_TIMEZONE`, `SCHEDULE_ENABLED`). It holds an advisory lock so two
-schedulers — or a manual `lexcrawl daily` — cannot run at once; APScheduler also uses
-`max_instances=1`.
+`SCHEDULE_DAILY_CRON`, `SCHEDULE_TIMEZONE`, `SCHEDULE_ENABLED`). A `SCHEDULER_ADVISORY_LOCK_KEY`
+advisory lock keeps two scheduler processes from running at once, and each source holds its own
+per-source lock during a crawl (see Scalability below); APScheduler also uses `max_instances=1`.
 
 Two guards run during `daily`:
 
@@ -233,11 +240,49 @@ Read endpoints (repository-backed, no SQL in handlers): `GET /sources`, `/source
 `/documents/{id}/resources`, `/documents/{id}/text`, `/runs`, `/runs/{run_id}` (errors bounded by
 `error_limit<=500`, with `errors_total`), `/analytics/credits`, `/analytics/pending`.
 
-`POST /jobs` validates source codes, accepts `Idempotency-Key` (≤128 chars), returns **202** with a
-`run_id`, and **409** when a job is already active. Single-active execution is enforced atomically by
-a PostgreSQL partial unique index on `jobs` (plus the advisory lock during the crawl). The worker
-claims jobs with `SKIP LOCKED`, holds the advisory lock, and executes `run_daily`. GitHub Actions runs
-`lexcrawl daily --source all` daily and via `workflow_dispatch`.
+`POST /jobs` validates source codes, accepts `Idempotency-Key` (≤128 chars), and returns **202** with
+one job per requested source (each with its own `run_id`), or **409** when a job for that source is
+already active. Per-source active execution is enforced atomically by a PostgreSQL partial unique
+index on `jobs` (`UNIQUE (source) WHERE status IN ('queued','claimed','running')`). The worker claims
+jobs with `SKIP LOCKED` and executes `run_daily`; each source holds its own PG advisory lock
+(`advisory_lock_key_for(source)`), so sources run in parallel and one slow source cannot block the
+others. GitHub Actions runs `lexcrawl daily --source all` daily and via `workflow_dispatch`.
+
+## Scalability (Phase 4)
+
+- **Worker engine reuse** (`worker.run_forever` / `resource_worker.run_resources_forever`): one engine
+  and session factory per worker process instead of per poll.
+- **Per-source locks and jobs**: `advisory_lock_key_for(source)` plus a per-source partial unique
+  index; `POST /jobs` fans out one job per source.
+- **Resource queue** (`lexcrawl worker --queue resources`): a separate worker claims due PDF
+  attachments with the existing claim lease and runs PyMuPDF in a `ProcessPoolExecutor`, so
+  CPU-heavy extraction scales independently of crawling.
+- **Batched persistence**: `filter_known(source, keys)` answers with `identity_key = ANY(:keys)`;
+  `upsert_documents_batch` writes a page with one `INSERT ... ON CONFLICT DO UPDATE` and the
+  monotonic rule in a `CASE`.
+- **Cache**: `HttpFetcher` uses a bounded LRU (`CRAWL_CACHE_MAX_ENTRIES`, default 256) and never
+  caches binary payloads; the Firecrawl cache lives under `data/`, persisted by the `crawlstate`
+  volume. Requests are paced **per host** via a shared `HostPacer`.
+- **Partial indexes**: `ix_documents_due` and `ix_document_resources_claimed` keep the due-count and
+  claim queries fast.
+- **Metrics**: `GET /metrics` exposes Prometheus counters/gauges (runs, duration, credits, failures,
+  queue depth) and does not require auth.
+- **Source registry** (`sources/registry.py`): a `SourceSpec` per source (scraper, check, actor,
+  redirect hosts). Adding a source is one registry entry — no `factory.py` edits.
+- **Shared actor base** (`actors/detail.py`): `DetailAcquisitionActor` owns the listing→detail loop
+  (anomaly guard, detail budget, budget-stop handling, scrape → validate → cache → canonicalize);
+  UAE and Commerce supply only parsing and canonicalization.
+
+## Adding a source
+
+Add one entry to `REGISTRY` in `src/lexcrawl/sources/registry.py` with the source's DB identity
+(`code`, `display_name`, `base_url`), `build_scraper`, `build_check`, `build_actor`, and
+`redirect_hosts`. `SOURCE_NAMES`, `CHECK_SOURCES`, the HTTP allowlists, the CLI choices, and the
+API's accepted source codes all derive from the registry, and the `sources` table is seeded from it
+at API and crawl startup (idempotent), so the entry is registered automatically. A source that
+fetches detail pages through a shared provider can subclass `DetailAcquisitionActor` and implement
+`_parse`, `_identity`, `_detail_url`, `_store_document`, `_store_partial`, and `_fail_item`; the
+acquisition loop itself is inherited.
 
 ## Pre-API hardening
 
@@ -247,7 +292,7 @@ claims jobs with `SKIP LOCKED`, holds the advisory lock, and executes `run_daily
 - **Indexes**: `(source_id, published_at DESC NULLS LAST, id DESC)`, `(published_at DESC NULLS
   LAST, id DESC)`, `GIN(topics)` — validated with `EXPLAIN` (the list query uses an index-only scan).
 - **Credits** (`services/credit_accounting.py`): actual + reserved from PostgreSQL; the governor and
-  analytics share it. The JSON `UsageStore` remains only for `STATE_BACKEND=json`.
+  analytics share it.
 - **Run coordination** (`locking.AdvisoryLock`): a session-level PostgreSQL advisory lock held on a
   dedicated connection for the whole crawl; the scheduler and worker share the key.
 - **Job queue** (`jobs` table + `repositories/jobs.py`): idempotent enqueue, `SKIP LOCKED` claim,

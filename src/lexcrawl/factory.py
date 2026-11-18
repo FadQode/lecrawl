@@ -1,70 +1,54 @@
-"""### Composition root: build source checks, actors, and acquisition strategies."""
+"""### Composition root: DB-backed components plus the source registry re-exports.
+
+Source-specific builders (checks, actors, scrapers, host allowlists) live in
+``lexcrawl.sources``; this module keeps the process-wide persistence wiring and
+re-exports the registry entry points so callers can keep importing them from ``factory``.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import urlparse
 
 from sqlalchemy import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
-from lexcrawl.actors.base import Actor
-from lexcrawl.actors.cba import CbaNewsReleasesActor
-from lexcrawl.actors.commerce import CommerceReportsActor
-from lexcrawl.actors.uae_legislation import UaeLegislationActor
-from lexcrawl.checks.base import Check
-from lexcrawl.checks.cba import CbaCheck
-from lexcrawl.checks.checkpoints import CheckpointStore, DbCheckpointStore, JsonCheckpointStore
-from lexcrawl.checks.commerce import CommerceCheck
-from lexcrawl.checks.identities import DocumentMemory, JsonDocumentMemory
-from lexcrawl.checks.run_records import DbRunRecorder, NoOpRunRecorder, RunRecorder
-from lexcrawl.checks.uae import UaeCheck
+from lexcrawl.checks.checkpoints import CheckpointStore, DbCheckpointStore
+from lexcrawl.checks.identities import DocumentMemory
+from lexcrawl.checks.run_records import DbRunRecorder, RunRecorder
 from lexcrawl.config import Settings
 from lexcrawl.crawling.base import Fetcher
-from lexcrawl.crawling.direct import DirectHtmlScraper
-from lexcrawl.crawling.fallback import FallbackScraper
-from lexcrawl.crawling.firecrawl import FirecrawlClient
-from lexcrawl.crawling.http import HttpFetcher
-from lexcrawl.crawling.scrape import Scraper
+from lexcrawl.crawling.http import HostPacer, HttpFetcher
 from lexcrawl.db.engine import create_db_engine
+from lexcrawl.db.session import create_session_factory, session_scope
+from lexcrawl.logging import get_logger
 from lexcrawl.repositories.memory import DbDocumentMemory
+from lexcrawl.repositories.sources import seed_sources
 from lexcrawl.services.fetchers import HttpResourceFetcher
+from lexcrawl.sources import (  # $ Re-exported for existing importers.$
+    CHECK_SOURCES,
+    REGISTRY,
+    SOURCE_NAMES,
+    build_actor,
+    build_check,
+    build_firecrawl,
+    build_scraper,
+    cba_sitemap_url,
+    redirect_host_allowlist,
+    uae_allowed_hosts,
+)
 
-SOURCE_NAMES = ("uae", "commerce", "cba")
-CHECK_SOURCES = ("uae", "commerce", "cba")
+LOGGER = get_logger(__name__)
 
-# $ Sources whose acquisition path spends provider credits (Firecrawl).$
-CREDIT_SOURCES = ("commerce", "uae")  # $ UAE can fall back to Firecrawl when challenged.$
-
-
-def build_firecrawl(settings: Settings) -> FirecrawlClient:
-    """### Build the Firecrawl scraper from validated settings."""
-    return FirecrawlClient(
-        api_key=settings.firecrawl_api_key,
-        api_url=settings.firecrawl_api_url,
-        timeout_seconds=settings.firecrawl_timeout_seconds,
-        max_retries=settings.firecrawl_max_retries,
-        request_delay_seconds=settings.firecrawl_request_delay_seconds,
-        cache_dir=settings.firecrawl_cache_dir or None,
-    )
+# $ One pacer per process, so strategies in this process targeting a host share a cadence.$
+_HOST_PACER: HostPacer | None = None
 
 
-def redirect_host_allowlist(settings: Settings) -> tuple[str, ...]:
-    """### Allow redirects among configured source hosts and their www aliases."""
-    hosts: set[str] = set()
-    for value in (
-        settings.releases_api_url,
-        settings.releases_site_url,
-        settings.listings_url,
-        settings.reports_listing_url,
-    ):
-        host = (urlparse(value).hostname or value).lower().rstrip(".")
-        if not host:
-            continue
-        hosts.add(host)
-        hosts.add(host[4:] if host.startswith("www.") else f"www.{host}")
-    return tuple(sorted(hosts))
+def shared_host_pacer() -> HostPacer:
+    """### Return the process-wide per-host request pacer, creating it on first use."""
+    global _HOST_PACER
+    if _HOST_PACER is None:
+        _HOST_PACER = HostPacer()
+    return _HOST_PACER
 
 
 def build_http_fetcher(settings: Settings) -> Fetcher:
@@ -76,56 +60,38 @@ def build_http_fetcher(settings: Settings) -> Fetcher:
         backoff_seconds=settings.crawl_retry_backoff_seconds,
         request_delay_seconds=settings.crawl_request_delay_seconds,
         max_response_bytes=settings.crawl_max_response_bytes,
+        max_cache_entries=settings.crawl_cache_max_entries,
         allowed_redirect_hosts=redirect_host_allowlist(settings),
         allowed_hosts=redirect_host_allowlist(settings),
+        host_pacer=shared_host_pacer(),
     )
 
 
-def uae_allowed_hosts(settings: Settings) -> tuple[str, ...]:
-    """### Allow direct fetches among the UAE listing host and its www alias."""
-    host = (urlparse(settings.listings_url).hostname or "").lower().rstrip(".")
-    if not host:
-        return ()
-    return tuple(sorted({host, host[4:] if host.startswith("www.") else f"www.{host}"}))
-
-
-def build_uae_scraper(settings: Settings) -> Scraper:
-    """### Build the UAE acquisition path: direct when unchallenged, Firecrawl as the fallback."""
-    firecrawl = build_firecrawl(settings)
-    if not settings.uae_direct_fetch:
-        return firecrawl
-    direct = DirectHtmlScraper(
+def build_resource_fetcher(settings: Settings) -> HttpFetcher:
+    """### Build an HTTP fetcher for attachments (host suffixes, no in-memory cache)."""
+    return HttpFetcher(
         user_agent=settings.crawl_user_agent,
         timeout_seconds=settings.crawl_request_timeout_seconds,
-        retry_delay_seconds=settings.crawl_retry_backoff_seconds,
-        allowed_hosts=uae_allowed_hosts(settings),
+        max_retries=settings.crawl_max_retries,
+        backoff_seconds=settings.crawl_retry_backoff_seconds,
+        request_delay_seconds=settings.crawl_request_delay_seconds,
+        max_response_bytes=settings.resource_max_bytes,
+        allowed_suffixes=tuple(settings.resource_allowed_host_suffixes),
+        enable_cache=False,
+        host_pacer=shared_host_pacer(),
     )
-    return FallbackScraper(primary=direct, fallback=firecrawl)
-
-
-def build_scraper(name: str, settings: Settings) -> Scraper | None:
-    """### Build the acquisition strategy a source uses, if any."""
-    if name == "uae":
-        return build_uae_scraper(settings)
-    if name == "commerce":
-        return build_firecrawl(settings)
-    return None
 
 
 def build_document_memory(settings: Settings, *, engine: Engine | None = None) -> DocumentMemory:
     """### Build the identity memory, optionally sharing an injected engine."""
-    if settings.state_backend == "json":
-        return JsonDocumentMemory(Path(settings.identities_state_path))
     if engine is not None:
         owns_engine = False
     else:
-        if not settings.database_url.strip():
-            raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
         engine = create_db_engine(settings)
         owns_engine = True
     return DbDocumentMemory(
         engine,
-        fetcher=HttpResourceFetcher(build_http_fetcher(settings)),
+        fetcher=HttpResourceFetcher(build_resource_fetcher(settings)),
         attempt_cap=settings.resource_extraction_attempts,
         max_bytes=settings.resource_max_bytes,
         lease_seconds=settings.resource_claim_lease_seconds,
@@ -138,7 +104,7 @@ def build_document_memory(settings: Settings, *, engine: Engine | None = None) -
 class Runtime:
     """### Process-wide persistence components sharing one engine."""
 
-    engine: Engine | None
+    engine: Engine
     memory: DocumentMemory
     checkpoints: CheckpointStore
     recorder: RunRecorder
@@ -148,24 +114,16 @@ class Runtime:
         """### Close components (no-op for borrowed engines), then dispose if owned."""
         for component in (self.memory, self.checkpoints, self.recorder):
             component.close()
-        if self.owns_engine and self.engine is not None:
+        if self.owns_engine:
             self.engine.dispose()
 
 
 def build_runtime(settings: Settings, *, engine: Engine | None = None) -> Runtime:
-    """### Build memory/checkpoints/recorder over one engine (or JSON components)."""
-    if settings.state_backend == "json":
-        return Runtime(
-            engine=None,
-            memory=build_document_memory(settings),
-            checkpoints=build_checkpoint_store(settings),
-            recorder=build_run_recorder(settings),
-        )
+    """### Build memory/checkpoints/recorder over one shared engine."""
     owns_engine = engine is None
     if engine is None:
-        if not settings.database_url.strip():
-            raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
         engine = create_db_engine(settings)
+    _seed_registry_sources(engine)
     return Runtime(
         engine=engine,
         memory=build_document_memory(settings, engine=engine),
@@ -175,96 +133,53 @@ def build_runtime(settings: Settings, *, engine: Engine | None = None) -> Runtim
     )
 
 
+def ensure_registry_sources(factory: sessionmaker[Session]) -> int:
+    """### Seed every registered source into the sources table (idempotent)."""
+    rows = [(spec.code, spec.display_name, spec.base_url) for spec in REGISTRY.values()]
+    with session_scope(factory) as session:
+        return seed_sources(session, rows)
+
+
+def _seed_registry_sources(engine: Engine) -> None:
+    """### Best-effort source seeding so a failed seed never blocks building the runtime."""
+    try:
+        ensure_registry_sources(create_session_factory(engine))
+    except Exception:
+        # $ A run still fails loudly later if a source is genuinely missing.$
+        LOGGER.warning("source_seed_failed")
+
+
 def build_run_recorder(settings: Settings, *, engine: Engine | None = None) -> RunRecorder:
     """### Build the crawl-run recorder, optionally sharing an injected engine."""
-    if settings.state_backend == "json":
-        return NoOpRunRecorder()
     if engine is not None:
         return DbRunRecorder(engine, owns_engine=False)
-    if not settings.database_url.strip():
-        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
     return DbRunRecorder(create_db_engine(settings))
 
 
 def build_checkpoint_store(settings: Settings, *, engine: Engine | None = None) -> CheckpointStore:
     """### Build the checkpoint store, optionally sharing an injected engine."""
-    if settings.state_backend == "json":
-        return JsonCheckpointStore(Path(settings.check_state_path))
     if engine is not None:
         return DbCheckpointStore(engine, owns_engine=False)
-    if not settings.database_url.strip():
-        raise ValueError("DATABASE_URL is required when STATE_BACKEND=db; set it or use STATE_BACKEND=json")
     return DbCheckpointStore(create_db_engine(settings))
 
 
-def cba_sitemap_url(settings: Settings) -> str:
-    """### Derive the CBA sitemap URL from the configured site URL."""
-    site = settings.releases_site_url.strip()
-    if not site:
-        raise ValueError("RELEASES_SITE_URL is not configured; set it in .env (see .env.example)")
-    return f"{site.rstrip('/')}/sitemap.xml"
-
-
-def build_check(name: str, settings: Settings, *, scraper: Scraper | None, http_fetcher: Fetcher) -> Check:
-    """### Build the change probe for one source."""
-    if name == "uae":
-        if scraper is None:
-            raise ValueError("the UAE check requires a scraper")
-        return UaeCheck(listing_url=settings.listings_url, scraper=scraper)
-    if name == "commerce":
-        if scraper is None:
-            raise ValueError("the Commerce check requires a scraper")
-        return CommerceCheck(listing_url=settings.reports_listing_url, scraper=scraper)
-    if name == "cba":
-        return CbaCheck(sitemap_url=cba_sitemap_url(settings), fetcher=http_fetcher)
-    raise ValueError(f"unknown source {name!r}")
-
-
-def build_actor(
-    name: str,
-    settings: Settings,
-    *,
-    scraper: Scraper | None,
-    http_fetcher: Fetcher,
-    max_pages: int | None = None,
-    is_known: Callable[[str], bool] | None = None,
-    max_new_items: int | None = None,
-) -> Actor:
-    """### Build one actor sharing a scraper and an optional known-identity predicate."""
-    if name == "cba":
-        return CbaNewsReleasesActor(
-            api_url=settings.releases_api_url,
-            site_url=settings.releases_site_url,
-            api_language=settings.releases_api_language,
-            type_guid=settings.releases_type_id,
-            article_path=settings.releases_article_path,
-            page_size=settings.releases_page_size,
-            max_pages=max_pages if max_pages is not None else settings.releases_max_pages,
-            is_known=is_known,
-            max_new_items=max_new_items,
-        )
-    if name == "commerce":
-        if scraper is None:
-            raise ValueError("the Commerce actor requires a scraper")
-        return CommerceReportsActor(
-            listing_url=settings.reports_listing_url,
-            firecrawl=scraper,
-            max_pages=max_pages if max_pages is not None else settings.firecrawl_max_pages_per_run,
-            max_detail_scrapes=settings.firecrawl_max_detail_scrapes_per_run,
-            min_body_words=settings.firecrawl_min_body_words,
-            is_known=is_known,
-            max_new_items=max_new_items,
-        )
-    if name == "uae":
-        if scraper is None:
-            raise ValueError("the UAE actor requires a scraper")
-        return UaeLegislationActor(
-            listing_url=settings.listings_url,
-            firecrawl=scraper,
-            max_pages=max_pages if max_pages is not None else settings.crawl_max_listing_pages,
-            max_detail_scrapes=settings.uae_max_detail_scrapes_per_run,
-            min_body_words=settings.firecrawl_min_body_words,
-            is_known=is_known,
-            max_new_items=max_new_items,
-        )
-    raise ValueError(f"unknown source {name!r}")
+__all__ = [
+    "CHECK_SOURCES",
+    "SOURCE_NAMES",
+    "Runtime",
+    "build_actor",
+    "build_check",
+    "build_checkpoint_store",
+    "build_document_memory",
+    "build_firecrawl",
+    "build_http_fetcher",
+    "build_resource_fetcher",
+    "build_run_recorder",
+    "build_runtime",
+    "build_scraper",
+    "cba_sitemap_url",
+    "ensure_registry_sources",
+    "redirect_host_allowlist",
+    "shared_host_pacer",
+    "uae_allowed_hosts",
+]

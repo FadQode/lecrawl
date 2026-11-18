@@ -43,9 +43,21 @@ class ScrapeChallengeError(ScrapeError):
     """### The source refused the request with a challenge; the caller must fail closed."""
 
 
+class BudgetExceededError(ScrapeError):
+    """### The monthly provider credit budget has been reached."""
+
+
 class Scraper(Protocol):
     """### Minimal acquisition interface the source actors depend on."""
 
     def scrape(self, url: str, *, cache: bool = False) -> ScrapedPage:
-        """### Acquire one URL or raise a `ScrapeError`."""
+        """### Acquire one URL (read-through cache) or raise a `ScrapeError`."""
+        ...
+
+    def store(self, url: str, page: ScrapedPage) -> None:
+        """### Persist a successfully parsed page to the provider cache, if supported."""
+        ...
+
+    def evict(self, url: str) -> None:
+        """### Remove a cached page so the next attempt fetches a fresh copy."""
         ...

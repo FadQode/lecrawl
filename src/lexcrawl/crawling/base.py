@@ -147,7 +147,9 @@ def redact_message(text: str, *, limit: int = 2000) -> str:
     return redacted[:limit]
 
 
-def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
+def validate_http_url(
+    url: str, *, allowed_hosts: tuple[str, ...] = (), allowed_suffixes: tuple[str, ...] = ()
+) -> str:
     """### Validate a request destination and an optional hostname allowlist."""
     parts = urlparse(url)
     host = (parts.hostname or "").lower().rstrip(".")
@@ -161,8 +163,12 @@ def validate_http_url(url: str, *, allowed_hosts: tuple[str, ...] = ()) -> str:
         address = None
     if address is not None and not address.is_global:
         raise FetchError("non-public IP destinations are not allowed", url=url)
-    if allowed_hosts:
+    if allowed_hosts or allowed_suffixes:
         permitted = {value.lower().rstrip(".") for value in allowed_hosts}
-        if host not in permitted:
+        host_allowed = host in permitted or any(
+            host == suffix.lower().lstrip(".") or host.endswith("." + suffix.lower().lstrip("."))
+            for suffix in allowed_suffixes
+        )
+        if not host_allowed:
             raise FetchError("destination host is not allowed", url=url)
     return url

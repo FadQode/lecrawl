@@ -89,6 +89,14 @@ class DirectHtmlScraper:
         assert last_error is not None
         raise last_error
 
+    def store(self, url: str, page: ScrapedPage) -> None:
+        """### Direct fetching has no persistent cache."""
+        return None
+
+    def evict(self, url: str) -> None:
+        """### Direct fetching has no persistent cache."""
+        return None
+
     def _acquire(self, url: str) -> ScrapedPage:
         """### Follow in-scope redirects, failing closed on a challenge response."""
         current = url

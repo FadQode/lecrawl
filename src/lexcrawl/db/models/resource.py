@@ -57,6 +57,11 @@ class DocumentResource(Base):
         CheckConstraint("attempts >= 0", name="attempts_non_negative"),
         Index("ix_document_resources_document_id", "document_id"),
         Index("ix_document_resources_status_attempts", "status", "attempts"),
+        Index(
+            "ix_document_resources_claimed",
+            "claimed_at",
+            postgresql_where=sql_text("kind = 'pdf' AND status IN ('pending', 'failed')"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)

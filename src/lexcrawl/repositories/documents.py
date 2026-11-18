@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Text, any_, bindparam, func, literal_column, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from lexcrawl.db.models import Document
@@ -19,6 +20,46 @@ from lexcrawl.models.document import CanonicalDocument
 
 COMPLETE = "complete"
 DUE_STATUSES = ("pending", "failed")
+
+# $ The monotonic content rule, expressed for ON CONFLICT: a failed re-fetch never
+# $ replaces good content, and only an unsuccessful pass increments attempts.$
+_INCOMING_SUCCESS = "(excluded.extraction_status = 'complete' AND excluded.text IS NOT NULL)"
+_TAKE_CONTENT = f"({_INCOMING_SUCCESS} OR documents.extraction_status IS DISTINCT FROM 'complete')"
+_MONOTONIC_SET: dict[Any, Any] = {
+    "text": text(f"CASE WHEN {_TAKE_CONTENT} THEN excluded.text ELSE documents.text END"),
+    "content_hash": text(f"CASE WHEN {_TAKE_CONTENT} THEN excluded.content_hash ELSE documents.content_hash END"),
+    "extraction_status": text(
+        f"CASE WHEN {_TAKE_CONTENT} THEN excluded.extraction_status ELSE documents.extraction_status END"
+    ),
+    "extraction_error": text(
+        f"CASE WHEN {_TAKE_CONTENT} THEN excluded.extraction_error ELSE documents.extraction_error END"
+    ),
+    "extraction_attempts": text(
+        f"CASE WHEN NOT {_INCOMING_SUCCESS} "
+        "THEN LEAST(documents.extraction_attempts + 1, 32767) "
+        "ELSE documents.extraction_attempts END"
+    ),
+    "native_id": text("excluded.native_id"),
+    "source_url": text("excluded.source_url"),
+    "title": text("excluded.title"),
+    "language": text("excluded.language"),
+    "document_type": text("excluded.document_type"),
+    "summary": text("COALESCE(excluded.summary, documents.summary)"),
+    "image_url": text("COALESCE(excluded.image_url, documents.image_url)"),
+    "published_at": text("COALESCE(excluded.published_at, documents.published_at)"),
+    "published_month": text("COALESCE(excluded.published_month, documents.published_month)"),
+    "published_year": text("COALESCE(excluded.published_year, documents.published_year)"),
+    "published_date_raw": text("COALESCE(excluded.published_date_raw, documents.published_date_raw)"),
+    "published_precision": text(
+        "CASE WHEN excluded.published_precision <> 'unknown' "
+        "THEN excluded.published_precision ELSE documents.published_precision END"
+    ),
+    "topics": text(
+        "CASE WHEN cardinality(excluded.topics) > 0 THEN excluded.topics ELSE documents.topics END"
+    ),
+    "last_seen_at": text("excluded.last_seen_at"),
+    "updated_at": text("excluded.updated_at"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,15 +178,83 @@ def upsert_document(session: Session, *, source_id: int, document: CanonicalDocu
 def upsert_documents(
     session: Session, *, source_id: int, documents: Sequence[CanonicalDocument], now: datetime
 ) -> UpsertCounts:
-    """### Upsert every document, returning inserted and updated counts."""
-    inserted = 0
+    """### Upsert every document in one statement, returning inserted and updated counts."""
+    counts, _ = upsert_documents_batch(session, source_id=source_id, documents=documents, now=now)
+    return counts
+
+
+def _upsert_row(document: CanonicalDocument, source_id: int, now: datetime) -> dict[str, Any]:
+    """### Build one INSERT row, including the insert-only bookkeeping columns."""
+    values = _values(document, source_id)
+    values.update(
+        {
+            "extraction_attempts": 0 if _is_successful(document) else 1,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    return values
+
+
+def upsert_documents_batch(
+    session: Session, *, source_id: int, documents: Sequence[CanonicalDocument], now: datetime
+) -> tuple[UpsertCounts, dict[str, int]]:
+    """### Upsert a page of documents in one `INSERT ... ON CONFLICT`, returning their ids.
+
+    The monotonic rule is applied in the `DO UPDATE` clause so the write stays a single
+    round trip; `xmax = 0` distinguishes a fresh insert from a refresh.
+    """
+    rows: dict[str, dict[str, Any]] = {}
     for document in documents:
-        _, was_inserted = upsert_document_with_status(
-            session, source_id=source_id, document=document, now=now
-        )
-        if was_inserted:
+        rows[str(document.identity_key)] = _upsert_row(document, source_id, now)
+    if not rows:
+        return UpsertCounts(), {}
+    statement: Any = (
+        pg_insert(Document)
+        .values(list(rows.values()))
+        .on_conflict_do_update(index_elements=["source_id", "identity_key"], set_=_MONOTONIC_SET)
+        .returning(Document.id, Document.identity_key, literal_column("(xmax = 0)").label("inserted"))
+    )
+    ids: dict[str, int] = {}
+    inserted = 0
+    for row in session.execute(statement).all():
+        ids[str(row.identity_key)] = int(row.id)
+        if row.inserted:
             inserted += 1
-    return UpsertCounts(inserted=inserted, updated=len(documents) - inserted)
+    return UpsertCounts(inserted=inserted, updated=len(rows) - inserted), ids
+
+
+def filter_known(session: Session, *, source_id: int, keys: Sequence[str]) -> frozenset[str]:
+    """### Return which of the candidate identities already have a completed extraction.
+
+    Uses `identity_key = ANY(:keys)` so the lookup scans only the candidates (plus the
+    `(source_id, identity_key)` index) instead of every stored document for the source.
+    """
+    candidates = list(dict.fromkeys(str(key) for key in keys))
+    if not candidates:
+        return frozenset()
+    rows = session.scalars(
+        select(Document.identity_key).where(
+            Document.source_id == source_id,
+            Document.identity_key == any_(bindparam("keys", type_=Text())),
+            Document.extraction_status == COMPLETE,
+        ),
+        {"keys": candidates},
+    )
+    return frozenset(rows)
+
+
+def has_baseline(session: Session, *, source_id: int) -> bool:
+    """### Report whether the source has at least one completed document."""
+    return bool(
+        session.scalar(
+            select(Document.id)
+            .where(Document.source_id == source_id, Document.extraction_status == COMPLETE)
+            .limit(1)
+        )
+    )
 
 
 def known_identities(session: Session, *, source_id: int) -> frozenset[str]:

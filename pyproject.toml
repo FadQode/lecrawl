@@ -32,6 +32,7 @@ dev = [
     "respx>=0.22,<1.0",
     "ruff>=0.9,<1.0",
     "mypy>=1.13,<2.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
@@ -58,6 +59,9 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -81,3 +85,11 @@ markers = [
     "live: requires network access to the target source",
     "db: requires a running PostgreSQL database (DATABASE_URL)",
 ]
+
+[tool.coverage.run]
+source = ["lexcrawl"]
+omit = ["*/lexcrawl/api/contracts.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:"]

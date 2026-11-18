@@ -30,6 +30,19 @@ class MemoizingScraper:
         self._pages[url] = page
         return page
 
+    def store(self, url: str, page: ScrapedPage) -> None:
+        """### Forward a validated page to the wrapped strategy's cache."""
+        store = getattr(self._inner, "store", None)
+        if callable(store):
+            store(url, page)
+
+    def evict(self, url: str) -> None:
+        """### Drop the memo entry and forward eviction to the wrapped strategy."""
+        self._pages.pop(url, None)
+        evict = getattr(self._inner, "evict", None)
+        if callable(evict):
+            evict(url)
+
     def close(self) -> None:
         """### Release the wrapped strategy."""
         closer = getattr(self._inner, "close", None)

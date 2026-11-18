@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from lexcrawl.db.models import Source
 
-# $ Canonical source codes; seeded into the database.$
+# $ Fallback seed used only when the source registry is unavailable.$
 SEED_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("uae_legislation_news", "UAE Legislation news", "https://uaelegislation.gov.ae"),
     ("cba_news_releases", "CBA news releases", "https://cba.ca"),
@@ -29,3 +31,13 @@ def ensure_source(session: Session, code: str, name: str, base_url: str | None =
     session.add(source)
     session.flush()
     return source.id
+
+
+def seed_sources(session: Session, rows: Sequence[tuple[str, str, str | None]]) -> int:
+    """### Insert any missing sources from the registry rows; return how many were created."""
+    created = 0
+    for code, name, base_url in rows:
+        if source_id_for(session, code) is None:
+            ensure_source(session, code, name, base_url)
+            created += 1
+    return created
