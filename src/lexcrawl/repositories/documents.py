@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Text, any_, bindparam, func, literal_column, select, text
+from sqlalchemy import func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -229,21 +229,29 @@ def upsert_documents_batch(
 def filter_known(session: Session, *, source_id: int, keys: Sequence[str]) -> frozenset[str]:
     """### Return which of the candidate identities already have a completed extraction.
 
-    Uses `identity_key = ANY(:keys)` so the lookup scans only the candidates (plus the
-    `(source_id, identity_key)` index) instead of every stored document for the source.
+    Uses an expanding `identity_key IN (...)` over the candidates only (served by the
+    `(source_id, identity_key)` index) instead of loading every stored document.
     """
     candidates = list(dict.fromkeys(str(key) for key in keys))
     if not candidates:
         return frozenset()
-    rows = session.scalars(
-        select(Document.identity_key).where(
-            Document.source_id == source_id,
-            Document.identity_key == any_(bindparam("keys", type_=Text())),
-            Document.extraction_status == COMPLETE,
-        ),
-        {"keys": candidates},
-    )
-    return frozenset(rows)
+    known: set[str] = set()
+    # $ Chunked so a very long listing never builds an oversized parameter list.$
+    for start in range(0, len(candidates), _FILTER_CHUNK):
+        chunk = candidates[start : start + _FILTER_CHUNK]
+        known.update(
+            session.scalars(
+                select(Document.identity_key).where(
+                    Document.source_id == source_id,
+                    Document.identity_key.in_(chunk),
+                    Document.extraction_status == COMPLETE,
+                )
+            )
+        )
+    return frozenset(known)
+
+
+_FILTER_CHUNK = 1000
 
 
 def has_baseline(session: Session, *, source_id: int) -> bool:
