@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     job_claim_lease_seconds: int = Field(default=900, ge=1)
+    # $ Run queued jobs inside the API process (single-container hosts with no separate worker).$
+    embedded_worker: bool = False
 
     # --- Attachment (PDF) extraction ---------------------------------------
     resource_extraction_attempts: int = Field(default=3, ge=1, le=20)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session, sessionmaker
 
 from lexcrawl.api.auth import require_bearer_token
@@ -24,6 +24,7 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
     dependencies=[Depends(require_bearer_token)],
 )
 def submit_job(
+    request: Request,
     payload: JobRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     factory: sessionmaker[Session] = Depends(get_factory),
@@ -63,6 +64,10 @@ def submit_job(
                     status_code=409, detail=f"a crawl job is already active for source {source!r}"
                 ) from error
             jobs.append(_job_ref(source, result.run_id, "queued"))
+    # $ Kick only after the transaction above has committed, so the runner can see the jobs.$
+    drainer = getattr(request.app.state, "drainer", None)
+    if drainer is not None:
+        drainer.kick()
     return JobAccepted(jobs=jobs)
 
 
